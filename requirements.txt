@@ -4,6 +4,7 @@ transformers>=4.49.0
 tokenizers>=0.20.3
 accelerate>=1.1.1
 tqdm
+tensorboard
 imageio
 easydict
 ftfy
@@ -19,3 +20,5 @@ optimum-quanto==0.2.6
 scenedetect
 moviepy==1.0.3
 decord
+mediapipe
+bitsandbytes

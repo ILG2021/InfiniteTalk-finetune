@@ -526,13 +526,13 @@ class InfiniteTalkPipeline:
                     1,
                 ).unsqueeze(
                     1
-                ) + indices.unsqueeze(0)
+                ) + indices.unsqueeze(0)   # N, 5
                 center_indices = torch.clamp(center_indices, min=0, max=full_audio_embs[human_idx].shape[0]-1)
-                audio_emb = full_audio_embs[human_idx][center_indices][None,...].to(self.device)
+                audio_emb = full_audio_embs[human_idx][center_indices][None,...].to(self.device)  # 1 x 帧数 x 5 x 12 x 768
                 audio_embs.append(audio_emb)
             audio_embs = torch.concat(audio_embs, dim=0).to(self.param_dtype)
             torch_gc()
-
+            # multitalk_14B.vae_stride = (4, 8, 8)
             h, w = cond_image.shape[-2], cond_image.shape[-1]
             lat_h, lat_w = h // self.vae_stride[1], w // self.vae_stride[2]
             max_seq_len = ((frame_num - 1) // self.vae_stride[0] + 1) * lat_h * lat_w // (
@@ -540,7 +540,7 @@ class InfiniteTalkPipeline:
             max_seq_len = int(math.ceil(max_seq_len / self.sp_size)) * self.sp_size
 
 
-
+            # 16是潜空间通道数
             noise = torch.randn(
                 16, (frame_num - 1) // 4 + 1,
                 lat_h,
@@ -567,9 +567,10 @@ class InfiniteTalkPipeline:
                 torch_gc()
 
                 # zero padding and vae encode
+                # cond_image: [1, 3, 1, H, W] [B, C, T, H, W]
                 video_frames = torch.zeros(1, cond_image.shape[1], frame_num-cond_image.shape[2], target_h, target_w).to(self.device)
                 padding_frames_pixels_values = torch.concat([cond_image, video_frames], dim=2)
-                y = self.vae.encode(padding_frames_pixels_values) 
+                y = self.vae.encode(padding_frames_pixels_values) # T H W是4 8 8的压缩比。C从3变成16
                 y = torch.stack(y).to(self.param_dtype) # B C T H W
                 cur_motion_frames_latent_num = int(1 + (cur_motion_frames_num-1) // 4)
 
