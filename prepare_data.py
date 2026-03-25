@@ -28,7 +28,7 @@ from pathlib import Path
 from tqdm import tqdm
 
 def get_crop_params(video_path, target_w, target_h):
-    """Detect face and calculate crop dimensions to keep face centered using modern MediaPipe Tasks API."""
+    """Detect face and calculate crop dimensions to keep face centered using robust multi-frame sampling."""
     import cv2
     import os
     import mediapipe as mp
@@ -36,49 +36,60 @@ def get_crop_params(video_path, target_w, target_h):
     from mediapipe.tasks.python import vision
 
     cap = cv2.VideoCapture(video_path)
-    ret, frame = cap.read()
-    cap.release()
-    if not ret: return None
-    
-    h, w = frame.shape[:2]
-    cx, cy = w // 2, h // 2  # Default center
+    if not cap.isOpened():
+        print(f"Error: Could not open video {video_path}")
+        return None
 
-    # MediaPipe Tasks API (v0.10+)
-    model_path = os.path.join('weights', 'face_detector.tflite')
-    
-    # Auto-download model (only ~2MB) if missing
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+
+    # Heuristic: check multiple frames (10%, 33%, 50%) to find a face
+    sample_points = [total_frames // 10, total_frames // 3, total_frames // 2]
+    cx, cy = w // 2, h // 2  # Default center
+    face_found = False
+
+    # Use 'full_range' model (~2.3MB) which is better for studio/mid-range shots than 'short_range'
+    model_path = os.path.join('weights', 'face_detector_full.tflite')
     if not os.path.exists(model_path):
+        os.makedirs('weights', exist_ok=True)
         try:
-            os.makedirs('weights', exist_ok=True)
             import urllib.request
-            print(f"Downloading MediaPipe face detector model to {model_path}...")
-            url = "https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite"
+            print(f"Downloading robust full-range face detector to {model_path}...")
+            url = "https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_full_range/float16/1/blaze_face_full_range.tflite"
             urllib.request.urlretrieve(url, model_path)
         except Exception as e:
-            print(f"Auto-download failed: {e}. Please ensure network access or manually place model at {model_path}")
+            print(f"Auto-download failed: {e}. Falling back to default center if model missing.")
 
     try:
         if os.path.exists(model_path):
             base_options = python.BaseOptions(model_asset_path=model_path)
             options = vision.FaceDetectorOptions(base_options=base_options)
-            
+
             with vision.FaceDetector.create_from_options(options) as detector:
-                # Convert to MediaPipe Image
-                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, 
-                                    data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-                detection_result = detector.detect(mp_image)
-                
-                if detection_result.detections:
-                    bbox = detection_result.detections[0].bounding_box
-                    cx = int(bbox.origin_x + bbox.width / 2)
-                    cy = int(bbox.origin_y + bbox.height / 2)
-                    print(f"  Face detected at ({cx}, {cy})")
-                else:
-                    print("  No face detected, using center-crop fallback.")
-        else:
-            print("  Model file missing, using center-crop fallback.")
+                for sp in sample_points:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, sp)
+                    ret, frame = cap.read()
+                    if not ret: continue
+
+                    # Convert to MediaPipe Image
+                    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB,
+                                        data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                    detection_result = detector.detect(mp_image)
+
+                    if detection_result.detections:
+                        bbox = detection_result.detections[0].bounding_box
+                        cx = int(bbox.origin_x + bbox.width / 2)
+                        cy = int(bbox.origin_y + bbox.height / 2)
+                        face_found = True
+                        print(f"  Face detected at frame {sp}: position ({cx}, {cy})")
+                        break # Found a face, use these coordinates
     except Exception as e:
-        print(f"  MediaPipe Tasks Detection Failed: {e}. Using center-crop fallback.")
+        print(f"  MediaPipe Detection Failed: {e}. Using center-crop fallback.")
+
+    cap.release()
+    if not face_found:
+        print("  Warning: No face detected in sample frames. Using center-crop fallback.")
 
     # Calculate crop dimensions
     target_ratio = target_w / target_h

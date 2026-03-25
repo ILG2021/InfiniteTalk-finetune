@@ -2,6 +2,19 @@
 
 本指南专为在单张 RTX 5090 (32GB VRAM) 上对 InfiniteTalk 模型进行单人视频数据的 LoRA 微调而设计。
 
+## 0. 环境与预训练
+创建一个python 3.10虚拟环境
+```bash
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+pip install -r requirements.txt
+
+huggingface-cli download Wan-AI/Wan2.1-I2V-14B-480P --local-dir ./weights/Wan2.1-I2V-14B-480P
+huggingface-cli download TencentGameMate/chinese-wav2vec2-base --local-dir ./weights/chinese-wav2vec2-base
+huggingface-cli download TencentGameMate/chinese-wav2vec2-base model.safetensors --revision refs/pr/1 --local-dir ./weights/chinese-wav2vec2-base
+huggingface-cli download MeiGen-AI/InfiniteTalk single/infinitetalk.safetensors --local-dir ./weights/InfiniteTalk
+```
+
+
 ## 1. 原理与策略
 
 由于 InfiniteTalk (14B) 的基础模型过大（BF16格式下约需 28GB 显存），无法直接在单张 32GB 显卡上进行梯度回传。因此我们采用以下并行微调策略：
@@ -32,7 +45,9 @@ python prepare_data.py \
     --output_dir ./training_data \
     --wav2vec_model weights/chinese-wav2vec2-base \
     --prompt "A person is talking." \
-    --device cuda:0
+    --device cuda:0 \
+    --target_h 832 \
+    --target_w 540
 ```
 > **输出规范**：该脚本会在 `./training_data` 目录下生成统一的 `videos` 和处理后的 `audio_embs` 及 `metadata.json`，这就是下一步的训练数据集。
 
@@ -52,7 +67,7 @@ python train_lora.py \
     --max_steps 1000 \
     --frame_num 17 \
     --target_h 832 \
-    --target_w 480 \
+    --target_w 540 \
     --ref_neighbor_frames 25 \
     --cfg_drop_text_prob 0.1 \
     --cfg_drop_audio_prob 0.1 \
@@ -62,7 +77,8 @@ python train_lora.py \
     --use_amp \
     --output_dir output/my_lora \
     --save_every 200 \
-    --log_every 10
+    --log_every 10 \
+    --debug_assert_shapes
 ```
 
 ### 参数建议：

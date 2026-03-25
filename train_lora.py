@@ -13,6 +13,8 @@ import warnings
 from datetime import datetime
 from typing import Optional, Union, List, Any, Dict, cast, Tuple
 
+from safetensors import safe_open
+
 warnings.filterwarnings('ignore')
 
 import numpy as np
