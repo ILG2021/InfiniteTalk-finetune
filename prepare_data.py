@@ -91,7 +91,7 @@ def extract_audio_from_video(video_path, target_sr=16000):
     return waveform.squeeze(0), target_sr
 
 
-def extract_wav2vec2_embeddings(audio_path_or_waveform, processor, wav2vec_model, 
+def extract_wav2vec2_embeddings(audio_path_or_waveform, feature_extractor, wav2vec_model, 
                                  video_fps=25, sr=16000, device='cpu'):
     """
     Extract wav2vec2 embeddings frame-aligned to video.
@@ -107,25 +107,18 @@ def extract_wav2vec2_embeddings(audio_path_or_waveform, processor, wav2vec_model
     num_video_frames = int(audio_duration * video_fps)
 
     # Process through wav2vec2
-    inputs = processor(waveform, sampling_rate=sr, return_tensors="pt", padding=True)
-    input_values = inputs.input_values.to(device)
+    input_values = feature_extractor(waveform.numpy(), sampling_rate=sr).input_values
+    input_values = np.squeeze(input_values)
+    input_values = torch.from_numpy(input_values).float().to(device)
+    input_values = input_values.unsqueeze(0)
 
     with torch.no_grad():
-        outputs = wav2vec_model(input_values, output_hidden_states=True)
+        outputs = wav2vec_model(input_values, seq_len=num_video_frames, output_hidden_states=True)
 
-    # Stack all 12 hidden states (skip input embedding)
-    hidden_states = torch.stack(outputs.hidden_states[1:], dim=1)  # 1, 12, T_audio, 768
-    hidden_states = hidden_states.squeeze(0).permute(1, 0, 2)  # T_audio, 12, 768
-
-    # Align to video frames via interpolation
-    T_audio = hidden_states.shape[0]
-    if T_audio != num_video_frames:
-        # Linear interpolation to match video frame count
-        hidden_states = hidden_states.permute(1, 2, 0)  # 12, 768, T_audio
-        hidden_states = torch.nn.functional.interpolate(
-            hidden_states.unsqueeze(0), size=num_video_frames, mode='linear', align_corners=False
-        ).squeeze(0)  # 12, 768, num_video_frames
-        hidden_states = hidden_states.permute(2, 0, 1)  # num_video_frames, 12, 768
+    # The custom Wav2Vec2Model already performs interpolation if seq_len is provided.
+    # hidden_states will be list of layers, each [B, T, D]
+    hidden_states = torch.stack(outputs.hidden_states[1:], dim=1)  # B, 12, num_video_frames, 768
+    hidden_states = hidden_states.squeeze(0).permute(1, 0, 2)  # num_video_frames, 12, 768
 
     return hidden_states.cpu()
 
@@ -179,11 +172,14 @@ def main():
     os.makedirs(os.path.join(args.output_dir, 'videos'), exist_ok=True)
     os.makedirs(os.path.join(args.output_dir, 'audio_embs'), exist_ok=True)
 
-    # Load wav2vec2
+    # Load wav2vec2 (inference style)
     print(f"Loading wav2vec2 model: {args.wav2vec_model}")
-    from transformers import Wav2Vec2Processor, Wav2Vec2Model
-    processor = Wav2Vec2Processor.from_pretrained(args.wav2vec_model)
-    wav2vec_model = Wav2Vec2Model.from_pretrained(args.wav2vec_model).to(args.device).eval()
+    from transformers import Wav2Vec2FeatureExtractor
+    from src.audio_analysis.wav2vec2 import Wav2Vec2Model
+    processor = Wav2Vec2FeatureExtractor.from_pretrained(args.wav2vec_model, local_files_only=True)
+    wav2vec_model = Wav2Vec2Model.from_pretrained(args.wav2vec_model, local_files_only=True).to(args.device)
+    wav2vec_model.feature_extractor._freeze_parameters()
+    wav2vec_model.eval()
     print("wav2vec2 loaded!")
 
     # Process videos
