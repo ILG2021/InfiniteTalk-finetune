@@ -28,8 +28,13 @@ from pathlib import Path
 from tqdm import tqdm
 
 def get_crop_params(video_path, target_w, target_h):
-    """Detect face and calculate crop dimensions to keep face centered."""
+    """Detect face and calculate crop dimensions to keep face centered using modern MediaPipe Tasks API."""
     import cv2
+    import os
+    import mediapipe as mp
+    from mediapipe.tasks import python
+    from mediapipe.tasks.python import vision
+
     cap = cv2.VideoCapture(video_path)
     ret, frame = cap.read()
     cap.release()
@@ -37,27 +42,45 @@ def get_crop_params(video_path, target_w, target_h):
     
     h, w = frame.shape[:2]
     cx, cy = w // 2, h // 2  # Default center
-    
-    try:
-        import mediapipe as mp
-        mp_face_detection = mp.solutions.face_detection
-        with mp_face_detection.FaceDetection(model_selection=1, min_detection_confidence=0.5) as face_detection:
-            results = face_detection.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            if results.detections:
-                bbox = results.detections[0].location_data.relative_bounding_box
-                cx = int((bbox.xmin + bbox.width / 2) * w)
-                cy = int((bbox.ymin + bbox.height / 2) * h)
-    except ImportError:
-        # Fallback to OpenCV Haar Cascades
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-        faces = face_cascade.detectMultiScale(gray, 1.1, 4)
-        if len(faces) > 0:
-            faces = sorted(faces, key=lambda x: x[2]*x[3], reverse=True)
-            fx, fy, fw, fh = faces[0]
-            cx = fx + fw // 2
-            cy = fy + fh // 2
 
+    # MediaPipe Tasks API (v0.10+)
+    model_path = os.path.join('weights', 'face_detector.tflite')
+    
+    # Auto-download model (only ~2MB) if missing
+    if not os.path.exists(model_path):
+        try:
+            os.makedirs('weights', exist_ok=True)
+            import urllib.request
+            print(f"Downloading MediaPipe face detector model to {model_path}...")
+            url = "https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite"
+            urllib.request.urlretrieve(url, model_path)
+        except Exception as e:
+            print(f"Auto-download failed: {e}. Please ensure network access or manually place model at {model_path}")
+
+    try:
+        if os.path.exists(model_path):
+            base_options = python.BaseOptions(model_asset_path=model_path)
+            options = vision.FaceDetectorOptions(base_options=base_options)
+            
+            with vision.FaceDetector.create_from_options(options) as detector:
+                # Convert to MediaPipe Image
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, 
+                                    data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                detection_result = detector.detect(mp_image)
+                
+                if detection_result.detections:
+                    bbox = detection_result.detections[0].bounding_box
+                    cx = int(bbox.origin_x + bbox.width / 2)
+                    cy = int(bbox.origin_y + bbox.height / 2)
+                    print(f"  Face detected at ({cx}, {cy})")
+                else:
+                    print("  No face detected, using center-crop fallback.")
+        else:
+            print("  Model file missing, using center-crop fallback.")
+    except Exception as e:
+        print(f"  MediaPipe Tasks Detection Failed: {e}. Using center-crop fallback.")
+
+    # Calculate crop dimensions
     target_ratio = target_w / target_h
     src_ratio = w / h
     
