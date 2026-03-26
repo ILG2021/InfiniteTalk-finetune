@@ -693,25 +693,10 @@ def train(args):
     logging.info(f"Trainable params: {total_trainable:,} / {total_params:,} "
                  f"({100 * total_trainable / total_params:.4f}%)")
 
-    # Enable gradient checkpointing (with Monkey Patch for WanModel)
+    # Enable gradient checkpointing
     if args.gradient_checkpointing:
-        # 1. Force diffusers to accept this model by patching the Class
-        type(model)._supports_gradient_checkpointing = True
-
-        enabled = False
-        if hasattr(model, "enable_gradient_checkpointing"):
-            try:
-                model.enable_gradient_checkpointing()
-                enabled = True
-            except Exception as e:
-                logging.warning(f"  Native enable_gradient_checkpointing failed: {e}")
-
-        # 2. Direct attribute fallback (common for Wan/DiT structures)
-        if not enabled and hasattr(model, "gradient_checkpointing"):
-            setattr(model, "gradient_checkpointing", True)
-            enabled = True
-
-        logging.info(f"Gradient checkpointing: {'ENABLED (patched)' if enabled else 'FAILED TO ENABLE'}")
+        model.gradient_checkpointing = True
+        logging.info("Gradient checkpointing: ENABLED")
 
     # ---- Optimizer ----
     optimizer = torch.optim.AdamW(lora_params, lr=args.lr, weight_decay=args.weight_decay)

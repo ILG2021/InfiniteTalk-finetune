@@ -764,7 +764,7 @@ class WanModel(ModelMixin, ConfigMixin):
                     self.previous_residual_uncond = x - ori_x
         else:
             for block in self.blocks:
-                if self.gradient_checkpointing and self.training:
+                if self.gradient_checkpointing and torch.is_grad_enabled():
                     x = torch.utils.checkpoint.checkpoint(
                         block, x, use_reentrant=False, **kwargs)
                 else:
