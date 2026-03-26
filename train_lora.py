@@ -712,7 +712,9 @@ def train(args):
         optimizer, T_max=args.max_steps, eta_min=args.lr * 0.1
     )
 
-    scaler = torch.amp.GradScaler('cuda', enabled=args.use_amp)
+    # GradScaler is only for float16; bfloat16 has float32-range exponents and needs no scaling.
+    # Enabling it with bfloat16 + quanto INT8 causes float32 gradient promotion → dtype mismatch.
+    scaler = torch.amp.GradScaler('cuda', enabled=False)
 
     tb_log_dir = args.tensorboard_dir or os.path.join(args.output_dir, "tensorboard")
     writer: Optional[Any] = None
