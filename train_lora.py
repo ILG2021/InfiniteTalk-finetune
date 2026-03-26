@@ -634,13 +634,19 @@ def train(args):
     )
 
     model = pipeline.model
-    # Explicitly keep VAE/CLIP on CPU if they aren't used for training weights
-    vae = pipeline.vae.to('cpu')
-    clip_model = pipeline.clip.to('cpu')
-    text_encoder = pipeline.text_encoder.to('cpu')
-    
-    # Save a reference to move back if needed (rare)
-    offloaded_models = [vae, clip_model, text_encoder]
+    # 1. Aggressively offload all large components to CPU permanently for training
+    # This leaves all 32GB VRAM for the 14B DiT + Gradients
+    for comp_name in ['vae', 'clip', 'text_encoder']:
+        comp = getattr(pipeline, comp_name, None)
+        if comp:
+            real_m = getattr(comp, 'model', comp)
+            if hasattr(real_m, 'to'):
+                real_m.to('cpu')
+                logging.info(f"PERMANENTLY offloaded {comp_name} to CPU")
+
+    vae = pipeline.vae
+    clip_model = pipeline.clip
+    text_encoder = pipeline.text_encoder
 
     # ---- Quantize frozen base model to reduce VRAM ----
     if args.quant == 'int8':
@@ -812,27 +818,30 @@ def train(args):
 
             with torch.no_grad():
                 if not is_continuation:
-                    # First clip: no context; Eq.(3) reduces to conditioning on xt only.
-                    video_target = video_full[:, :target_frames]
-                    x_1 = vae.encode([video_target])[0].to(device)  # C_lat, T_target, lat_h, lat_w
+                    # First clip: no context
+                    with torch.no_grad():
+                        video_target_cpu = video_full[:, :target_frames].to('cpu')
+                        ref_frame_cpu = ref_frame.unsqueeze(1).to('cpu')
+                        
+                        x_1 = vae.encode([video_target_cpu])[0].to(device)  # C_lat, T_target, lat_h, lat_w
+                        x_0 = vae.encode([ref_frame_cpu])[0].to(device)    # C_lat, 1, lat_h, lat_w
+                        
                     x_context = None
-                    total_latents = x_1.shape[1]
-                    audio_input = audio_emb_full[:target_frames].unsqueeze(0).to(torch.bfloat16)
+                    total_latents = x_0.shape[1] + x_1.shape[1]
+                    audio_input = audio_emb_full[:total_latents].unsqueeze(0).to(torch.bfloat16)
                 else:
                     # Continuation clip: Eq.(3) uses explicit temporal concatenation.
                     # context frames = 4*(tc-1)+1 (paper uses 9 frames when tc=3), target frames = frame_num
                     # Use non-overlapping concat as in Eq.(3): target starts after context.
-                    # [VRAM Fix] Move VAE/CLIP to GPU only when encoding
-                    vae.to(device)
-                    # Use a context manager to handle encoding
+                    # [VRAM Fix] VAE/CLIP are already on CPU. Move inputs to CPU, then results to GPU.
                     with torch.no_grad():
-                        video_context = video_full[:, :context_frames]
-                        video_target = video_full[:, context_frames: context_frames + target_frames]
-                        x_context = vae.encode([video_context])[0].to(device)  # C_lat, T_context, lat_h, lat_w
-                        x_1 = vae.encode([video_target])[0].to(device)  # C_lat, T_target, lat_h, lat_w
+                        video_context_cpu = video_full[:, :context_frames].to('cpu')
+                        video_target_cpu = video_full[:, context_frames: context_frames + target_frames].to('cpu')
+                        
+                        x_context = vae.encode([video_context_cpu])[0].to(device)  # C_lat, T_context, lat_h, lat_w
+                        x_1 = vae.encode([video_target_cpu])[0].to(device)  # C_lat, T_target, lat_h, lat_w
                     
-                    # IMMEDIATELY offload back to CPU to save 5GB+ for the DiT forward pass
-                    vae.to('cpu')
+                    # [VRAM Maintenance]
                     torch.cuda.empty_cache()
                     gc.collect()
 
@@ -843,7 +852,10 @@ def train(args):
                 C_lat, _, lat_h, lat_w = x_1.shape[0], x_1.shape[1], x_1.shape[2], x_1.shape[3]
 
                 # Build reference condition z2 + mask m directly in latent space to match total_latents.
-                ref_latent = vae.encode([ref_frame.unsqueeze(1)])[0].to(device)  # C_lat, 1, lat_h, lat_w
+                with torch.no_grad():
+                    ref_frame_cpu = ref_frame.unsqueeze(1).to('cpu')
+                    ref_latent = vae.encode([ref_frame_cpu])[0].to(device)  # C_lat, 1, lat_h, lat_w
+                
                 y_latent = torch.zeros(C_lat, total_latents, lat_h, lat_w, device=device, dtype=ref_latent.dtype)
                 y_latent[:, :1] = ref_latent
                 msk = torch.zeros(4, total_latents, lat_h, lat_w, device=device, dtype=ref_latent.dtype)
@@ -867,14 +879,16 @@ def train(args):
                 audio_input = torch.zeros_like(audio_input)
 
             with torch.no_grad():
-                clip_model.model.to(device)
-                ref_for_clip = ref_frame.unsqueeze(0).unsqueeze(2)
-                clip_fea = clip_model.visual(ref_for_clip).to(torch.bfloat16)
-                clip_model.model.cpu()
+                # [VRAM Optimize] CLIP and Text encoding strictly on CPU
+                ref_for_clip_cpu = ref_frame.unsqueeze(0).unsqueeze(2).to('cpu')
+                # clip_model is already permanently offloaded to CPU
+                clip_fea = clip_model.visual(ref_for_clip_cpu).to(device).to(torch.bfloat16)
 
                 prompt_list = prompt_batch
                 if drop_text:
                     prompt_list = [""] * len(prompt_list)
+                
+                # text_encoder is on CPU, just move results back
                 context_list = [t.to(device) for t in text_encoder(prompt_list, torch.device('cpu'))]
                 human_mask = torch.ones([lat_h, lat_w], device=device).unsqueeze(0).repeat(3, 1, 1).float()
 
