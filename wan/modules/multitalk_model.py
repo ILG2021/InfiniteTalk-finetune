@@ -438,6 +438,11 @@ class WanModel(ModelMixin, ConfigMixin):
         'patch_size', 'cross_attn_norm', 'qk_norm', 'text_dim', 'window_size'
     ]
     _no_split_modules = ['WanAttentionBlock']
+    _supports_gradient_checkpointing = True
+    gradient_checkpointing = False
+
+    def _set_gradient_checkpointing(self, module, value=False):
+        self.gradient_checkpointing = value
 
     @register_to_config
     def __init__(self,
@@ -759,7 +764,11 @@ class WanModel(ModelMixin, ConfigMixin):
                     self.previous_residual_uncond = x - ori_x
         else:
             for block in self.blocks:
-                x = block(x, **kwargs)
+                if self.gradient_checkpointing and self.training:
+                    x = torch.utils.checkpoint.checkpoint(
+                        block, x, use_reentrant=False, **kwargs)
+                else:
+                    x = block(x, **kwargs)
 
         # head
         x = self.head(x, e)
