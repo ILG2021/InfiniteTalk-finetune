@@ -634,19 +634,14 @@ def train(args):
     )
 
     model = pipeline.model
-    # 1. Aggressively offload all large components to CPU permanently for training
-    # This leaves all 32GB VRAM for the 14B DiT + Gradients
-    for comp_name in ['vae', 'clip', 'text_encoder']:
-        comp = getattr(pipeline, comp_name, None)
-        if comp:
-            real_m = getattr(comp, 'model', comp)
-            if hasattr(real_m, 'to'):
-                real_m.to('cpu')
-                logging.info(f"PERMANENTLY offloaded {comp_name} to CPU")
-
+    # Offload VAE/CLIP/T5 to CPU to save VRAM for the DiT
     vae = pipeline.vae
+    vae.to('cpu')  # WanVAE.to() moves model + mean/std/scale tensors together
     clip_model = pipeline.clip
+    clip_model.model.to('cpu').float()  # float16 not supported on CPU, cast to float32
     text_encoder = pipeline.text_encoder
+    text_encoder.model.to('cpu')
+    logging.info("Offloaded vae / clip / text_encoder to CPU")
 
     # ---- Quantize frozen base model to reduce VRAM ----
     if args.quant == 'int8':
