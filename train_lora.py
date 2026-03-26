@@ -3,6 +3,7 @@
 # Designed to run on a single RTX 5090 (32GB VRAM)
 
 import argparse
+import gc
 import json
 import logging
 import math
@@ -34,6 +35,7 @@ from wan.modules.multitalk_model import (
     WanModel, sinusoidal_embedding_1d, rope_params, rope_apply,
     AudioProjModel, WanLayerNorm, WanRMSNorm
 )
+
 
 # ============================================================
 # LoRA Module
@@ -71,10 +73,11 @@ class LoRALinear(nn.Module):
         return result + lora_out
 
 
-def apply_lora_to_model(model: nn.Module, rank: int = 16, alpha: float = 16.0, target_modules: Optional[List[str]] = None):
+def apply_lora_to_model(model: nn.Module, rank: int = 16, alpha: float = 16.0,
+                        target_modules: Optional[List[str]] = None):
     """
     Apply LoRA adapters to specified modules in the model.
-    
+
     Args:
         model: WanModel instance
         rank: LoRA rank
@@ -87,7 +90,7 @@ def apply_lora_to_model(model: nn.Module, rank: int = 16, alpha: float = 16.0, t
             'audio_cross_attn.q_linear',
             'audio_cross_attn.kv_linear',
             'audio_cross_attn.proj',
-            'audio_proj.proj1',     # will also match proj1_vf, see exact match below
+            'audio_proj.proj1',  # will also match proj1_vf, see exact match below
             'audio_proj.proj2',
             'audio_proj.proj3',
         ]
@@ -112,7 +115,7 @@ def apply_lora_to_model(model: nn.Module, rank: int = 16, alpha: float = 16.0, t
                 parent = parent[int(part)]
             else:
                 parent = getattr(parent, part)
-        
+
         lora_linear = LoRALinear(original_linear, rank=rank, alpha=alpha)
         setattr(parent, parts[-1], lora_linear)
         applied_count = cast(int, applied_count + 1)
@@ -125,7 +128,7 @@ def unfreeze_small_norms(model):
     """
     Unfreeze small normalization layers for direct fine-tuning.
     These are too small for LoRA, so we train them directly and save as diff.
-    
+
     Targets:
         - blocks.{i}.norm_x (WanLayerNorm, 10K params/block × 40 = 410K)
         - audio_proj.norm   (LayerNorm, 1.5K params)
@@ -144,7 +147,7 @@ def unfreeze_small_norms(model):
 def extract_lora_state_dict(model, original_norms=None):
     """
     Extract LoRA weights + norm_x diff in a format compatible with wan_lora.py.
-    
+
     Output key format:
         diffusion_model.{path}.lora_down.weight   (LoRA A matrix)
         diffusion_model.{path}.lora_up.weight     (LoRA B matrix)
@@ -152,7 +155,7 @@ def extract_lora_state_dict(model, original_norms=None):
         diffusion_model.{path}.diff_b              (direct bias diff)
     """
     state_dict = {}
-    
+
     # Extract LoRA weights
     for name, module in model.named_modules():
         if isinstance(module, LoRALinear):
@@ -161,7 +164,7 @@ def extract_lora_state_dict(model, original_norms=None):
             # Bake training-time LoRA scaling (alpha/rank) into lora_up so
             # merge-time delta = (B_scaled @ A) * lora_scale remains equivalent.
             state_dict[f"{prefix}.lora_up.weight"] = (module.lora_up.weight.data * module.scaling).clone().cpu()
-    
+
     # Extract norm_x diff weights (current - original)
     if original_norms is not None:
         for name, param in model.named_parameters():
@@ -174,7 +177,7 @@ def extract_lora_state_dict(model, original_norms=None):
                 elif name.endswith('.bias'):
                     lora_key = lora_key.replace('.bias', '.diff_b')
                 state_dict[lora_key] = diff
-    
+
     return state_dict
 
 
@@ -270,17 +273,17 @@ def _extract_trainable_state_dict(model: nn.Module) -> Dict[str, torch.Tensor]:
 
 
 def save_training_checkpoint(
-    output_dir: str,
-    step: int,
-    epoch: int,
-    model: nn.Module,
-    original_norms: Dict[str, torch.Tensor],
-    optimizer: torch.optim.Optimizer,
-    scheduler: Any,
-    scaler: Any,
-    args: argparse.Namespace,
-    suffix: Optional[str] = None,
-    write_latest: bool = True,
+        output_dir: str,
+        step: int,
+        epoch: int,
+        model: nn.Module,
+        original_norms: Dict[str, torch.Tensor],
+        optimizer: torch.optim.Optimizer,
+        scheduler: Any,
+        scaler: Any,
+        args: argparse.Namespace,
+        suffix: Optional[str] = None,
+        write_latest: bool = True,
 ) -> Tuple[str, str]:
     """
     Saves a Transformers/PEFT-like checkpoint directory containing:
@@ -337,12 +340,12 @@ def save_training_checkpoint(
 
 
 def load_training_checkpoint(
-    path: str,
-    model: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    scheduler: Any,
-    scaler: Any,
-    strict: bool = True,
+        path: str,
+        model: nn.Module,
+        optimizer: torch.optim.Optimizer,
+        scheduler: Any,
+        scaler: Any,
+        strict: bool = True,
 ) -> Tuple[int, int, Dict[str, torch.Tensor], Dict[str, Any]]:
     """Loads adapter weights + optimizer/scheduler/scaler/RNG. Supports new checkpoint dirs and legacy .pt."""
     if _is_legacy_training_pt(path):
@@ -450,7 +453,7 @@ def load_training_checkpoint(
 class InfiniteTalkDataset(Dataset):
     """
     Dataset for InfiniteTalk LoRA fine-tuning.
-    
+
     Expected data directory structure:
         data_dir/
         ├── videos/          # Video files (.mp4)
@@ -459,12 +462,12 @@ class InfiniteTalkDataset(Dataset):
     """
 
     def __init__(
-        self,
-        data_dir,
-        frame_num=17,
-        target_size=(480, 832),
-        audio_window=5,
-        ref_neighbor_frames: int = 25,
+            self,
+            data_dir,
+            frame_num=17,
+            target_size=(480, 832),
+            audio_window=5,
+            ref_neighbor_frames: int = 25,
     ):
         self.data_dir = data_dir
         self.frame_num = frame_num
@@ -488,7 +491,7 @@ class InfiniteTalkDataset(Dataset):
         from decord import VideoReader, cpu
         vr = VideoReader(video_path, ctx=cpu(0))
         total_frames = len(vr)
-        
+
         # Build indices handling padding explicitly
         indices = []
         for i in range(num_frames):
@@ -496,13 +499,13 @@ class InfiniteTalkDataset(Dataset):
             if idx >= total_frames:
                 idx = total_frames - 1
             indices.append(idx)
-            
+
         frames = vr.get_batch(indices).asnumpy()  # Returns (T, H, W, C)
-        
+
         # Convert to PyTorch format expected by the model
         video = torch.from_numpy(frames).permute(0, 3, 1, 2)  # T, C, H, W
         video = video.float() / 255.0  # [0, 1]
-        video = (video - 0.5) * 2      # [-1, 1]
+        video = (video - 0.5) * 2  # [-1, 1]
         return video
 
     def __getitem__(self, idx):
@@ -557,16 +560,27 @@ class InfiniteTalkDataset(Dataset):
 
         # Extract audio window for the FULL needed frames
         audio_window_indices = (torch.arange(self.audio_window) - self.audio_window // 2)
-        total_audio_indices = torch.arange(start_frame, start_frame + needed_frames).unsqueeze(1) + audio_window_indices.unsqueeze(0)
+        total_audio_indices = torch.arange(start_frame, start_frame + needed_frames).unsqueeze(
+            1) + audio_window_indices.unsqueeze(0)
         total_audio_indices = total_audio_indices.clamp(0, total_audio_frames - 1)
         full_audio_emb_segment = full_audio_emb[total_audio_indices]  # needed_frames, window, 12, 768
 
         return {
-            'video_full': video_full.permute(1, 0, 2, 3), # C, needed_frames, H, W
-            'ref_frame': ref_frame.squeeze(0),             # C, H, W
-            'audio_emb_full': full_audio_emb_segment,      # needed_frames, window, 12, 768
+            'video_full': video_full.permute(1, 0, 2, 3),  # C, needed_frames, H, W
+            'ref_frame': ref_frame.squeeze(0),  # C, H, W
+            'audio_emb_full': full_audio_emb_segment,  # needed_frames, window, 12, 768
             'prompt': prompt,
         }
+
+
+def count_trainable(model):
+    lora_params = []
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            lora_params.append(param)
+
+    total_trainable = sum(p.numel() for p in lora_params)
+    return total_trainable
 
 
 # ============================================================
@@ -589,7 +603,7 @@ def train(args):
         raise ValueError(
             "Sum of --cfg_drop_text_prob, --cfg_drop_audio_prob, --cfg_drop_both_prob must be <= 1.0"
         )
-    
+
     device = torch.device(f'cuda:{args.device_id}')
     torch.cuda.set_device(device)
 
@@ -619,55 +633,79 @@ def train(args):
     clip_model = pipeline.clip
     text_encoder = pipeline.text_encoder
 
-    # ---- Freeze everything ----
-    for param in model.parameters():
-        param.requires_grad = False
-        
     # ---- Quantize frozen base model to reduce VRAM ----
     if args.quant == 'int8':
         from optimum.quanto import quantize, freeze, qint8
         logging.info("Quantizing frozen base model to INT8 before applying LoRA...")
         quantize(model, weights=qint8)
         freeze(model)
-        logging.info("INT8 quantization applied to base layers.")
-    
+        logging.info(f"Memory after model.to & freeze: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
+        logging.info("INT8 quantization applied and base layers moved to device.")
+
+    # ---- Freeze everything (re-verify after quantization) ----
+    for param in model.parameters():
+        param.requires_grad = False
+
+    total_trainable = count_trainable(model)
+    logging.info(f"2 Total trainable parameters: {total_trainable:,}")
     # ---- Apply LoRA to Linear layers ----
     target_modules = args.target_modules.split(',') if args.target_modules else None
     model = apply_lora_to_model(model, rank=args.lora_rank, alpha=args.lora_alpha,
                                 target_modules=target_modules)
 
+    total_trainable = count_trainable(model)
+    logging.info(f"3 Total trainable parameters: {total_trainable:,}")
     # ---- Unfreeze small norms for direct training (too small for LoRA) ----
     original_norms = unfreeze_small_norms(model)
 
+    total_trainable = count_trainable(model)
+    logging.info(f"4 Total trainable parameters: {total_trainable:,}")
+
+    torch.cuda.empty_cache()
+    gc.collect()
+    model = model.to(device)
+    model.disable_teacache()
     # Move trainable params to float32 for training stability
     lora_params = []
     for name, param in model.named_parameters():
         if param.requires_grad:
-            param.data = param.data.float()
+            # [Fix] Only convert non-quantized FLOAT types (prevents crash on INT8 weights)
+            if not str(param.data.dtype).startswith("torch.int") and param.data.dtype != torch.float32:
+                try:
+                    param.data = param.data.float()
+                except:
+                    pass
             lora_params.append(param)
-            logging.info(f"  Trainable: {name} {param.shape}")
+            logging.info(f"  Trainable: {name} {param.shape} ({param.data.dtype})")
 
     total_trainable = sum(p.numel() for p in lora_params)
     total_params = sum(p.numel() for p in model.parameters())
     logging.info(f"Trainable params: {total_trainable:,} / {total_params:,} "
                  f"({100 * total_trainable / total_params:.4f}%)")
 
-    # Enable gradient checkpointing
+    # Enable gradient checkpointing (with Monkey Patch for WanModel)
     if args.gradient_checkpointing:
+        # 1. Force diffusers to accept this model by patching the Class
+        type(model)._supports_gradient_checkpointing = True
+
         enabled = False
         if hasattr(model, "enable_gradient_checkpointing"):
-            maybe_fn = getattr(model, "enable_gradient_checkpointing")
-            if callable(maybe_fn):
-                maybe_fn()
+            try:
+                model.enable_gradient_checkpointing()
                 enabled = True
+            except Exception as e:
+                logging.warning(f"  Native enable_gradient_checkpointing failed: {e}")
+
+        # 2. Direct attribute fallback (common for Wan/DiT structures)
         if not enabled and hasattr(model, "gradient_checkpointing"):
             setattr(model, "gradient_checkpointing", True)
             enabled = True
-        logging.info("Gradient checkpointing enabled" if enabled else "Gradient checkpointing requested, but model has no supported API")
+
+        logging.info(f"Gradient checkpointing: {'ENABLED (patched)' if enabled else 'FAILED TO ENABLE'}")
 
     # ---- Optimizer ----
     optimizer = torch.optim.AdamW(lora_params, lr=args.lr, weight_decay=args.weight_decay)
-    
+
     # ---- LR Scheduler ----
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.max_steps, eta_min=args.lr * 0.1
@@ -746,14 +784,14 @@ def train(args):
                 break
 
             video_full = batch['video_full'].to(device)[0]  # C, needed_frames, H, W
-            ref_frame = batch['ref_frame'].to(device)[0]    # C, H, W
-            audio_emb_full = batch['audio_emb_full'].to(device)[0] # needed_frames, window, 12, 768
+            ref_frame = batch['ref_frame'].to(device)[0]  # C, H, W
+            audio_emb_full = batch['audio_emb_full'].to(device)[0]  # needed_frames, window, 12, 768
             prompt = batch['prompt']
             if isinstance(prompt, str):
                 prompt_batch: List[str] = [prompt]
             else:
                 prompt_batch = list(prompt)
-            
+
             C, T_full, H, W = video_full.shape
             context_frames = 9
 
@@ -778,7 +816,7 @@ def train(args):
                     video_context = video_full[:, :context_frames]
                     video_target = video_full[:, context_frames: context_frames + target_frames]
                     x_context = vae.encode([video_context])[0].to(device)  # C_lat, T_context, lat_h, lat_w
-                    x_1 = vae.encode([video_target])[0].to(device)         # C_lat, T_target, lat_h, lat_w
+                    x_1 = vae.encode([video_target])[0].to(device)  # C_lat, T_target, lat_h, lat_w
                     total_latents = x_context.shape[1] + x_1.shape[1]
                     # Audio length should align with concatenated z1 timeline.
                     audio_input = audio_emb_full[:context_frames + target_frames].unsqueeze(0).to(torch.bfloat16)
@@ -827,7 +865,7 @@ def train(args):
             # Shift T
             t_frac = shift * t_frac / (1 + (shift - 1) * t_frac)
             t_shifted = t_frac * num_timesteps
-            
+
             x_t = cast(torch.Tensor, t_frac.view(1, 1, 1, 1) * x_0 + (1 - t_frac).view(1, 1, 1, 1) * x_1)
             target = x_1 - x_0
 
@@ -961,7 +999,7 @@ def train(args):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="InfiniteTalk LoRA Fine-tuning (Single Person)")
-    
+
     # Model paths
     parser.add_argument("--ckpt_dir", type=str, required=True,
                         help="Path to Wan2.1-I2V-14B checkpoint directory")
@@ -969,12 +1007,12 @@ def parse_args():
                         help="Path to infinitetalk.safetensors")
     parser.add_argument("--quant", type=str, default=None, choices=['int8', 'fp8', None],
                         help="Quantization for base model. Recommended: int8 for 5090")
-    
+
     # Data
     parser.add_argument("--data_dir", type=str, required=True,
                         help="Training data directory")
     parser.add_argument("--num_workers", type=int, default=2)
-    
+
     # LoRA config
     parser.add_argument("--lora_rank", type=int, default=16,
                         help="LoRA rank")
@@ -982,7 +1020,7 @@ def parse_args():
                         help="LoRA alpha")
     parser.add_argument("--target_modules", type=str, default=None,
                         help="Comma-separated target module patterns. Default: audio_cross_attn layers")
-    
+
     # Training config
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=0.01)
@@ -998,9 +1036,9 @@ def parse_args():
     )
     parser.add_argument("--first_clip_prob", type=float, default=0.2,
                         help="Probability of sampling first-clip training branch. Continuation prob is 1-p.")
-    parser.add_argument("--target_h", type=int, default=832, 
+    parser.add_argument("--target_h", type=int, default=832,
                         help="Target height. Recommend 832 for vertical 480P bucket")
-    parser.add_argument("--target_w", type=int, default=480, 
+    parser.add_argument("--target_w", type=int, default=480,
                         help="Target width. Recommend 480 for vertical 480P bucket")
     parser.add_argument("--gradient_checkpointing", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--use_amp", action=argparse.BooleanOptionalAction, default=True,
@@ -1037,7 +1075,7 @@ def parse_args():
     )
     parser.add_argument("--resume_strict", action=argparse.BooleanOptionalAction, default=True,
                         help="Strict checkpoint key match (trainable param names must match).")
-    
+
     # Output
     parser.add_argument("--output_dir", type=str, default="output/lora")
     parser.add_argument("--log_every", type=int, default=10)
