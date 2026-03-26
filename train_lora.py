@@ -634,9 +634,13 @@ def train(args):
     )
 
     model = pipeline.model
-    vae = pipeline.vae
-    clip_model = pipeline.clip
-    text_encoder = pipeline.text_encoder
+    # Explicitly keep VAE/CLIP on CPU if they aren't used for training weights
+    vae = pipeline.vae.to('cpu')
+    clip_model = pipeline.clip.to('cpu')
+    text_encoder = pipeline.text_encoder.to('cpu')
+    
+    # Save a reference to move back if needed (rare)
+    offloaded_models = [vae, clip_model, text_encoder]
 
     # ---- Quantize frozen base model to reduce VRAM ----
     if args.quant == 'int8':
@@ -818,10 +822,20 @@ def train(args):
                     # Continuation clip: Eq.(3) uses explicit temporal concatenation.
                     # context frames = 4*(tc-1)+1 (paper uses 9 frames when tc=3), target frames = frame_num
                     # Use non-overlapping concat as in Eq.(3): target starts after context.
-                    video_context = video_full[:, :context_frames]
-                    video_target = video_full[:, context_frames: context_frames + target_frames]
-                    x_context = vae.encode([video_context])[0].to(device)  # C_lat, T_context, lat_h, lat_w
-                    x_1 = vae.encode([video_target])[0].to(device)  # C_lat, T_target, lat_h, lat_w
+                    # [VRAM Fix] Move VAE/CLIP to GPU only when encoding
+                    vae.to(device)
+                    # Use a context manager to handle encoding
+                    with torch.no_grad():
+                        video_context = video_full[:, :context_frames]
+                        video_target = video_full[:, context_frames: context_frames + target_frames]
+                        x_context = vae.encode([video_context])[0].to(device)  # C_lat, T_context, lat_h, lat_w
+                        x_1 = vae.encode([video_target])[0].to(device)  # C_lat, T_target, lat_h, lat_w
+                    
+                    # IMMEDIATELY offload back to CPU to save 5GB+ for the DiT forward pass
+                    vae.to('cpu')
+                    torch.cuda.empty_cache()
+                    gc.collect()
+
                     total_latents = x_context.shape[1] + x_1.shape[1]
                     # Audio length should align with concatenated z1 timeline.
                     audio_input = audio_emb_full[:context_frames + target_frames].unsqueeze(0).to(torch.bfloat16)
