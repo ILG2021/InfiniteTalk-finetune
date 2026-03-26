@@ -679,10 +679,11 @@ def train(args):
     lora_params = []
     for name, param in model.named_parameters():
         if param.requires_grad:
-            # [Fix] Only convert non-quantized FLOAT types (prevents crash on INT8 weights)
-            if not str(param.data.dtype).startswith("torch.int") and param.data.dtype != torch.float32:
+            # [Fix] Forward/Backward Type Alignment for 5090 (Quanto + BF16 AMP)
+            # Use BFloat16 instead of Float32 to avoid mismatched dtypes in Quanto backward pass.
+            if not str(param.data.dtype).startswith("torch.int"):
                 try:
-                    param.data = param.data.float()
+                    param.data = param.data.to(torch.bfloat16)
                 except:
                     pass
             lora_params.append(param)
@@ -693,10 +694,15 @@ def train(args):
     logging.info(f"Trainable params: {total_trainable:,} / {total_params:,} "
                  f"({100 * total_trainable / total_params:.4f}%)")
 
-    # Enable gradient checkpointing
+    # Enable gradient checkpointing (Explicitly patch for WanModel)
     if args.gradient_checkpointing:
+        # Patch the class definition so the model instance knows it's supported
+        if not hasattr(type(model), '_supports_gradient_checkpointing'):
+            type(model)._supports_gradient_checkpointing = True
         model.gradient_checkpointing = True
-        logging.info("Gradient checkpointing: ENABLED")
+        if hasattr(model, 'gradient_checkpointing_enable'):
+            model.gradient_checkpointing_enable()
+        logging.info("Gradient checkpointing: FULLY ENABLED (Instance + Patch)")
 
     # ---- Optimizer ----
     optimizer = torch.optim.AdamW(lora_params, lr=args.lr, weight_decay=args.weight_decay)
