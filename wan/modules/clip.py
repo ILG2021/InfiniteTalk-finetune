@@ -82,7 +82,19 @@ class SelfAttention(nn.Module):
 
         # compute attention
         p = self.attn_dropout if self.training else 0.0
-        x = flash_attention(q, k, v, dropout_p=p, causal=self.causal, version=2)
+        
+        # [VRAM Optimize] If on CPU, use SDPA fallback because flash_attention only supports CUDA
+        if q.device.type == 'cpu':
+            x = torch.nn.functional.scaled_dot_product_attention(
+                q.transpose(1, 2).to(torch.float32), 
+                k.transpose(1, 2).to(torch.float32), 
+                v.transpose(1, 2).to(torch.float32), 
+                is_causal=self.causal, 
+                dropout_p=p
+            ).transpose(1, 2).to(q.dtype)
+        else:
+            x = flash_attention(q, k, v, dropout_p=p, causal=self.causal, version=2)
+            
         x = x.reshape(b, s, c)
 
         # output
@@ -194,7 +206,16 @@ class AttentionPool(nn.Module):
         k, v = self.to_kv(x).view(b, s, 2, n, d).unbind(2)
 
         # compute attention
-        x = flash_attention(q, k, v, version=2)
+        # [VRAM Optimize] CPU fallback for AttentionPool
+        if q.device.type == 'cpu':
+            x = torch.nn.functional.scaled_dot_product_attention(
+                q.transpose(1, 2).to(torch.float32), 
+                k.transpose(1, 2).to(torch.float32), 
+                v.transpose(1, 2).to(torch.float32)
+            ).transpose(1, 2).to(q.dtype)
+        else:
+            x = flash_attention(q, k, v, version=2)
+        
         x = x.reshape(b, 1, c)
 
         # output
