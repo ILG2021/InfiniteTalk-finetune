@@ -465,7 +465,7 @@ class InfiniteTalkDataset(Dataset):
             self,
             data_dir,
             frame_num=17,
-            target_size=(480, 832),
+            target_size=(832, 480),
             audio_window=5,
             ref_neighbor_frames: int = 25,
     ):
@@ -527,6 +527,11 @@ class InfiniteTalkDataset(Dataset):
         start_frame = random.randint(0, max_start) if max_start > 0 else 0
 
         # Load video frames (up to needed_frames)
+        # Also get total video frame count for correct reference frame boundary clamping.
+        from decord import VideoReader, cpu as decord_cpu
+        _vr = VideoReader(video_path, ctx=decord_cpu(0))
+        total_video_frames = len(_vr)
+        del _vr
         video_full = self._load_video_frames(video_path, start_frame, needed_frames)
         # Resize to target size
         video_full = F.interpolate(
@@ -541,8 +546,8 @@ class InfiniteTalkDataset(Dataset):
         nb = max(0, int(self.ref_neighbor_frames))
         left_lo = max(0, seg_start - nb)
         left_hi = max(0, seg_start - 1)
-        right_lo = min(total_audio_frames - 1, seg_end + 1)
-        right_hi = min(total_audio_frames - 1, seg_end + nb)
+        right_lo = min(total_video_frames - 1, seg_end + 1)
+        right_hi = min(total_video_frames - 1, seg_end + nb)
         candidates: List[int] = []
         if left_lo <= left_hi:
             candidates.append(random.randint(left_lo, left_hi))
@@ -551,7 +556,7 @@ class InfiniteTalkDataset(Dataset):
         if candidates:
             ref_offset = random.choice(candidates)
         else:
-            ref_offset = random.randint(0, total_audio_frames - 1)
+            ref_offset = random.randint(0, total_video_frames - 1)
         ref_video = self._load_video_frames(video_path, ref_offset, 1)
         ref_frame = F.interpolate(
             ref_video, size=(self.target_h, self.target_w),
@@ -724,7 +729,7 @@ def train(args):
     current_step = 0
     epoch = 0
     if args.resume_from:
-        if not os.path.isfile(args.resume_from):
+        if not os.path.exists(args.resume_from):
             raise FileNotFoundError(f"--resume_from not found: {args.resume_from}")
         current_step, epoch, original_norms, saved_args = load_training_checkpoint(
             args.resume_from,
@@ -968,7 +973,9 @@ def train(args):
                     logging.info(f"Saved inference LoRA: {inference_lora_path}")
 
             # Cleanup
-            del x_1, x_0, x_t, x_input, target, target_full, pred, loss
+            del x_1, x_0, x_t, x_input, target, target_full, loss_mask, pred, loss
+            if is_continuation and x_context is not None:
+                del x_context
             torch.cuda.empty_cache()
 
     # ---- Final save ----
