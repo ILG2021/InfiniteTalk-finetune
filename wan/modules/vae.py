@@ -644,6 +644,14 @@ class WanVAE:
             z_dim=z_dim,
         ).eval().requires_grad_(False).to(device)
 
+    def to(self, device):
+        self.device = device
+        self.model = self.model.to(device)
+        self.mean = self.mean.to(device)
+        self.std = self.std.to(device)
+        self.scale = [self.mean, 1.0 / self.std]
+        return self
+
     def encode(self, videos):
         """
         videos: A list of videos each with shape [C, T, H, W].
