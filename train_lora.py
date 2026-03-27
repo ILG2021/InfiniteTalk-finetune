@@ -68,15 +68,11 @@ class LoRALinear(nn.Module):
 
     def forward(self, x):
         # Original path (frozen) + LoRA path (trainable)
-        result = self.original_linear(x)
-        # quanto INT8 backward expects gO.dtype == weight_dequant.dtype (bfloat16).
-        # x may arrive as float32 from explicit float32 autocast regions in the block,
-        # causing result and its gradient to be float32. Hook casts gO to bfloat16
-        # before quanto's backward sees it.
-        if result.requires_grad:
-            result.register_hook(
-                lambda g: g.to(torch.bfloat16) if g is not None and g.dtype != torch.bfloat16 else g
-            )
+        # x may arrive as float32 from explicit amp.autocast(float32) regions in
+        # WanAttentionBlock. quanto INT8 backward requires gO.dtype == bfloat16
+        # (the dtype weights were dequantized to). Feed bfloat16 to original_linear
+        # so its output and backward gradient stay bfloat16.
+        result = self.original_linear(x.to(torch.bfloat16))
         lora_out = self.lora_up(self.lora_down(x)) * self.scaling
         return result + lora_out
 
