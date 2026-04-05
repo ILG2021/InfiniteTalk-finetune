@@ -771,6 +771,8 @@ def train(args):
     for name, module in model.named_modules():
         if any(p.requires_grad for p in module.parameters(recurse=False)):
             module.train()
+            
+    progress_bar = tqdm(total=args.max_steps, initial=current_step, desc="Training steps")
 
     while current_step < args.max_steps:
         epoch += 1
@@ -946,6 +948,12 @@ def train(args):
             scheduler.step()
 
             current_step = cast(int, current_step + 1)
+            progress_bar.update(1)
+            progress_bar.set_postfix(
+                loss=f"{loss.item():.4f}", 
+                lr=f"{optimizer.param_groups[0]['lr']:.2e}",
+                epoch=epoch
+            )
 
             # ---- TensorBoard ----
             if writer is not None:
@@ -961,13 +969,7 @@ def train(args):
 
             # ---- Logging ----
             if current_step % args.log_every == 0:
-                lr = optimizer.param_groups[0]['lr']
-                logging.info(
-                    f"Step {current_step}/{args.max_steps} | "
-                    f"Loss: {loss.item():.6f} | "
-                    f"LR: {lr:.2e} | "
-                    f"Epoch: {epoch}"
-                )
+                pass # logging to stdout is handled gracefully by tqdm now
 
             # ---- Save checkpoint ----
             if args.save_every > 0 and current_step % args.save_every == 0:
@@ -991,6 +993,8 @@ def train(args):
                 del x_context
             torch.cuda.empty_cache()
 
+    progress_bar.close()
+    
     # ---- Final save ----
     os.makedirs(args.output_dir, exist_ok=True)
     adapter_path, inference_lora_path = save_training_checkpoint(
