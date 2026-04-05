@@ -294,12 +294,11 @@ class WanAttentionBlock(nn.Module):
 
         # self-attention
         y, x_ref_attn_map = self.self_attn(
-            (self.norm1(x).float() * (1 + e[1]) + e[0]).type_as(x), seq_lens, grid_sizes,
+            torch.addcmul(e[0], self.norm1(x).float(), (1 + e[1])).type_as(x), seq_lens, grid_sizes,
             freqs, ref_target_masks=ref_target_masks)
-        with amp.autocast(dtype=torch.float32):
-            x = x + y * e[2]
         
-        x = x.to(dtype)
+        # In-place addcmul prevents expanding a huge FP32 intermediate tensor
+        x = torch.addcmul(x.float(), y.float(), e[2]).to(dtype)
 
         # cross-attention of text
         x = x + self.cross_attn(self.norm3(x), context, context_lens)
@@ -309,12 +308,8 @@ class WanAttentionBlock(nn.Module):
                                         shape=grid_sizes[0], x_ref_attn_map=x_ref_attn_map, human_num=human_num)
         x = x + x_a
 
-        y = self.ffn((self.norm2(x).float() * (1 + e[4]) + e[3]).to(dtype))
-        with amp.autocast(dtype=torch.float32):
-            x = x + y * e[5]
-
-
-        x = x.to(dtype)
+        y = self.ffn(torch.addcmul(e[3], self.norm2(x).float(), (1 + e[4])).to(dtype))
+        x = torch.addcmul(x.float(), y.float(), e[5]).to(dtype)
 
         return x
 
