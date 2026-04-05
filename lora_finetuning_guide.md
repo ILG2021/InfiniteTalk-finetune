@@ -19,10 +19,10 @@ huggingface-cli download MeiGen-AI/InfiniteTalk single/infinitetalk.safetensors 
 
 由于 InfiniteTalk (14B) 的基础模型过大（BF16格式下约需 28GB 显存），无法直接在单张 32GB 显卡上进行梯度回传。因此我们采用以下并行微调策略：
 
-1. **基础模型 INT8 量化**：加载基础权重后，使用 `optimum.quanto` 将非训练的 `Linear` 冻结并量化为 INT8。这样底座模型仅占约 14GB 显存。
-2. **混合训练策略**：
-    - **策略 A (大体量投影层) → LoRA 微调**：针对 `audio_proj` 中的线性映射层 (如 `proj1`, `proj1_vf`, `proj2` 等) 和所有 40 层 blocks 的 `audio_cross_attn` 相关的 `q_linear`, `kv_linear`, `proj` 投影层采用 LoRA 进行低秩微调，维持极少的显存开销。
-    - **策略 B (轻量归一化层) → 全参差异微调**：由于 `LayerNorm` (如 `norm_x` 和 `audio_proj.norm`) 参数量极小，挂载 LoRA 不具有性价比，且往往直接影响训练的收敛性，这些层将被完全解冻计算梯度，并最终以 `.diff` weight 和 bias 差值的形式保存。
+1. **基础模型 FP8 量化**：加载基础权重后，使用 FP8 精度进行计算，极大降低显存占用。
+2. **LoRA 微调策略**：
+    - 我们采用 **纯 LoRA (Low-Rank Adaptation)** 策略。针对底座模型中新增的音频投影层 (`audio_proj`) 和所有 40 层 blocks 的音频交叉注意力层 (`audio_cross_attn`) 中的线性层进行低秩适配。
+    - 底座权重保持冻结并量化，LoRA 参数以 FP32 训练并在导出时合并缩放系数 (scaling)，确保与推理侧脚本 (`wan_lora.py`) 完全匹配。
 
 ## 2. 数据准备
 
@@ -60,12 +60,12 @@ python train_lora.py \
     --ckpt_dir weights/Wan2.1-I2V-14B-480P \
     --infinitetalk_dir weights/InfiniteTalk/single/infinitetalk.safetensors \
     --data_dir ./training_data \
-    --quant int8 \
+    --quant fp8 \
     --lora_rank 16 \
     --lora_alpha 16 \
     --lr 5e-5 \
     --max_steps 1000 \
-    --frame_num 17 \
+    --frame_num 49 \
     --target_h 832 \
     --target_w 540 \
     --ref_neighbor_frames 25 \
@@ -82,21 +82,24 @@ python train_lora.py \
 ```
 
 ### 参数建议：
-- `--frame_num`: **强烈建议设为 17**。帧数必须为 `4n+1`（因 VAE 的时间轴压缩比为 4）。训练脚本会对 `4n+1` 进行强制校验，不满足会直接报错。
+- `--frame_num`: **强烈建议设为 33 或 49**。
+    - **33 (非常稳定)**: 约占 20-22GB 显存，适合后台运行。
+    - **49 (推荐/画质优先)**: 约占 25-27GB 显存，涵盖近 2 秒视频，能学到更好的连贯性。
+    - 注：帧数必须为 `4n+1`，如 17, 33, 49, 65...
 - `--target_h / --target_w`: 训练输入会被缩放到固定分辨率（默认为竖屏 `832x480`，即 `H=832, W=480`）。建议与你用 `prepare_data.py` 预处理的分辨率保持一致。
 - `--ref_neighbor_frames`: 参考帧采样窗口（单位：帧）。训练时参考帧会从当前片段左右相邻区域采样（论文 M3 思路），避免控制过强/过弱。默认 25（约 1 秒）。
 - `--cfg_drop_text_prob / --cfg_drop_audio_prob / --cfg_drop_both_prob`: CFG dropout 概率，用于让推理侧 Text/Audio CFG 更稳定、可控。三者之和必须小于等于 1。
 - `--debug_assert_shapes`: 首次开训建议打开，用于强制检查音频长度与 latent 时间轴对齐，避免 silent shape mismatch。
-- `--lora_rank / --lora_alpha`: **推荐为 16**。如果发现微调无法收敛或希望进一步加强人物关联特征，且监控到当前占用仍有余量，可以提升至 `32`。
-- `--quant int8`: 开启基础模型 INT8 量化，必须激活，否则显存溢出。
+- `--lora_rank / --lora_alpha`: **推荐为 16**。如果显存充裕可以提升至 `32` 以增强人物面部还原度。
+- `--quant fp8`: **必须开启**。使用 FP8 Monkey Patch 加速并极大压缩 base 模型显存，是 RTX 5090 运行 14B 模型的关键。
 - `--lr`: **推荐 5e-5 ~ 1e-4**。与全参微调不同，LoRA 容许适当使用偏大一点的学习率进行初期收敛。 
 
 ## 4. 显存监控与排障
 
 在执行过程中：
-1. **显存稳定区间应为 22G ~ 26G**，如果是多卡机器需要使用 `CUDA_VISIBLE_DEVICES=1` 等环境变量。
-2. 训练初期终端会打印所有的 Trainable 层名称信息，请特别关注是否存在以 `lora_down.weight`, `lora_up.weight` 为主的日志，并确认 `norm_x.weight` 等属于正常显式微调追踪队列。
-3. 如果发生 OOM：优先检查 `--frame_num` 是否依然是 17，其次尝试调小 `--lora_rank` (如 8)。
+1. **显存稳定区间应为 20G ~ 26G** (视 `--frame_num` 而定)。
+2. 训练初期终端会打印 Trainable 层，应看到 `lora_down.weight` 和 `lora_up.weight`。
+3. 如果发生 OOM：尝试设置环境变量 `set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`，或将 `--frame_num` 降至 33。
 
 ### 断点续训
 
@@ -105,12 +108,11 @@ python train_lora.py \
 ```
 <output_dir>/
   checkpoint-200/
-    adapter_model.safetensors
+    adapter_model.safetensors    # 训练用全参 adapter，支持断点续传
     optimizer.pt
     scheduler.pt
     scaler.pt
     rng_state.pth
-    original_norms.pt
     trainer_state.json
   checkpoint-final/
     ...

@@ -94,7 +94,8 @@ def apply_lora_to_model(model: nn.Module, rank: int = 16, alpha: float = 16.0,
             'audio_cross_attn.q_linear',
             'audio_cross_attn.kv_linear',
             'audio_cross_attn.proj',
-            'audio_proj.proj1',  # will also match proj1_vf, see exact match below
+            'audio_proj.proj1',
+            'audio_proj.proj1_vf',
             'audio_proj.proj2',
             'audio_proj.proj3',
         ]
@@ -104,9 +105,6 @@ def apply_lora_to_model(model: nn.Module, rank: int = 16, alpha: float = 16.0,
         if isinstance(module, nn.Linear) or type(module).__name__ == "QLinear":
             # Check if the full dotted name ends with one of the target patterns
             if any(name == target or name.endswith('.' + target) for target in target_modules):
-                lora_modules[name] = module
-            # Special case: audio_proj.proj1 should also match audio_proj.proj1_vf
-            elif 'audio_proj.proj1_vf' in name and 'audio_proj.proj1' in target_modules:
                 lora_modules[name] = module
 
     # Replace with LoRA versions
@@ -128,39 +126,17 @@ def apply_lora_to_model(model: nn.Module, rank: int = 16, alpha: float = 16.0,
     return model
 
 
-def unfreeze_small_norms(model):
-    """
-    Unfreeze small normalization layers for direct fine-tuning.
-    These are too small for LoRA, so we train them directly and save as diff.
-
-    Targets:
-        - blocks.{i}.norm_x (WanLayerNorm, 10K params/block × 40 = 410K)
-        - audio_proj.norm   (LayerNorm, 1.5K params)
-    """
-    original_weights = {}
-    count: int = 0
-    for name, param in model.named_parameters():
-        if 'norm_x.' in name or name.startswith('audio_proj.norm.'):
-            original_weights[name] = param.data.clone()
-            param.requires_grad = True
-            count = cast(int, count + 1)
-    logging.info(f"Unfroze {count} norm parameters for direct fine-tuning")
-    return original_weights
 
 
-def extract_lora_state_dict(model, original_norms=None):
+def extract_lora_state_dict(model):
     """
-    Extract LoRA weights + norm_x diff in a format compatible with wan_lora.py.
+    Extract LoRA weights in a format compatible with wan_lora.py.
 
     Output key format:
         diffusion_model.{path}.lora_down.weight   (LoRA A matrix)
         diffusion_model.{path}.lora_up.weight     (LoRA B matrix)
-        diffusion_model.{path}.diff                (direct weight diff)
-        diffusion_model.{path}.diff_b              (direct bias diff)
     """
     state_dict = {}
-
-    # Extract LoRA weights
     for name, module in model.named_modules():
         if isinstance(module, LoRALinear):
             prefix = f"diffusion_model.{name}"
@@ -168,20 +144,6 @@ def extract_lora_state_dict(model, original_norms=None):
             # Bake training-time LoRA scaling (alpha/rank) into lora_up so
             # merge-time delta = (B_scaled @ A) * lora_scale remains equivalent.
             state_dict[f"{prefix}.lora_up.weight"] = (module.lora_up.weight.data * module.scaling).clone().cpu()
-
-    # Extract norm_x diff weights (current - original)
-    if original_norms is not None:
-        for name, param in model.named_parameters():
-            if 'norm_x.' in name or name.startswith('audio_proj.norm.'):
-                diff = (param.data - original_norms[name].to(param.device)).cpu()
-                lora_key = f"diffusion_model.{name}"
-                # wan_lora.py expects .diff for weight, .diff_b for bias
-                if name.endswith('.weight'):
-                    lora_key = lora_key.replace('.weight', '.diff')
-                elif name.endswith('.bias'):
-                    lora_key = lora_key.replace('.bias', '.diff_b')
-                state_dict[lora_key] = diff
-
     return state_dict
 
 
@@ -281,20 +243,17 @@ def save_training_checkpoint(
         step: int,
         epoch: int,
         model: nn.Module,
-        original_norms: Dict[str, torch.Tensor],
         optimizer: torch.optim.Optimizer,
         scheduler: Any,
-        scaler: Any,
         args: argparse.Namespace,
         suffix: Optional[str] = None,
         write_latest: bool = True,
 ) -> Tuple[str, str]:
     """
     Saves a Transformers/PEFT-like checkpoint directory containing:
-    - adapter_model.safetensors (trainable parameters only: LoRA + small norm layers)
+    - adapter_model.safetensors (trainable LoRA parameters only)
     - optimizer.pt / scheduler.pt / scaler.pt
     - rng_state.pth
-    - original_norms.pt
     - trainer_state.json
 
     For inference, you typically only need a wan_lora-compatible safetensors. To avoid duplication,
@@ -312,12 +271,10 @@ def save_training_checkpoint(
     # 2) Training states
     torch.save(optimizer.state_dict(), os.path.join(ckpt_dir, "optimizer.pt"))
     torch.save(scheduler.state_dict(), os.path.join(ckpt_dir, "scheduler.pt"))
-    torch.save(scaler.state_dict(), os.path.join(ckpt_dir, "scaler.pt"))
     torch.save(_get_rng_state(), os.path.join(ckpt_dir, "rng_state.pth"))
-    torch.save({k: v.cpu().clone() for k, v in original_norms.items()}, os.path.join(ckpt_dir, "original_norms.pt"))
 
     trainer_state = {
-        "format_version": 2,
+        "format_version": 3,
         "step": step,
         "epoch": epoch,
         "args": _serialize_args(args),
@@ -327,7 +284,7 @@ def save_training_checkpoint(
     # 3) Optional inference LoRA export (wan_lora-compatible) to avoid duplication.
     inference_lora_path = ""
     if suffix is not None:
-        lora_sd = extract_lora_state_dict(model, original_norms)
+        lora_sd = extract_lora_state_dict(model)
         inference_lora_path = os.path.join(ckpt_dir, "lora_for_inference.safetensors")
         save_file(lora_sd, inference_lora_path)
 
@@ -348,9 +305,8 @@ def load_training_checkpoint(
         model: nn.Module,
         optimizer: torch.optim.Optimizer,
         scheduler: Any,
-        scaler: Any,
         strict: bool = True,
-) -> Tuple[int, int, Dict[str, torch.Tensor], Dict[str, Any]]:
+) -> Tuple[int, int, Dict[str, Any]]:
     """Loads adapter weights + optimizer/scheduler/scaler/RNG. Supports new checkpoint dirs and legacy .pt."""
     if _is_legacy_training_pt(path):
         ckpt = torch.load(path, map_location='cpu')
@@ -382,17 +338,15 @@ def load_training_checkpoint(
                 f"only_in_ckpt={repr(ckpt_keys - model_keys)}"
             )
 
-        original_norms = {k: v.clone() for k, v in ckpt['original_norms'].items()}
         optimizer.load_state_dict(ckpt['optimizer'])
         scheduler.load_state_dict(ckpt['scheduler'])
-        scaler.load_state_dict(ckpt['scaler'])
         _set_rng_state(ckpt['rng'])
 
         step = int(ckpt['step'])
         epoch = int(ckpt.get('epoch', 0))
         saved_args = ckpt.get('args', {})
         logging.info(f"Resumed (legacy) from {path}: step={step}, epoch={epoch}, trainable_tensors={loaded}")
-        return step, epoch, original_norms, saved_args
+        return step, epoch, saved_args
 
     ckpt_dir = _resolve_checkpoint_dir(path)
     if not os.path.isdir(ckpt_dir):
@@ -402,8 +356,8 @@ def load_training_checkpoint(
     if not os.path.isfile(trainer_state_path):
         raise FileNotFoundError(f"trainer_state.json not found in checkpoint dir: {ckpt_dir}")
     trainer_state = _load_json(trainer_state_path)
-    if int(trainer_state.get("format_version", 0)) != 2:
-        logging.warning(f"Checkpoint format_version={trainer_state.get('format_version')!r}; expected 2")
+    if int(trainer_state.get("format_version", 0)) not in (2, 3):
+        logging.warning(f"Checkpoint format_version={trainer_state.get('format_version')!r}; expected 3")
 
     # 1) Adapter weights
     adapter_path = os.path.join(ckpt_dir, "adapter_model.safetensors")
@@ -439,15 +393,13 @@ def load_training_checkpoint(
     # 2) Training states
     optimizer.load_state_dict(torch.load(os.path.join(ckpt_dir, "optimizer.pt"), map_location="cpu"))
     scheduler.load_state_dict(torch.load(os.path.join(ckpt_dir, "scheduler.pt"), map_location="cpu"))
-    scaler.load_state_dict(torch.load(os.path.join(ckpt_dir, "scaler.pt"), map_location="cpu"))
     _set_rng_state(torch.load(os.path.join(ckpt_dir, "rng_state.pth"), map_location="cpu"))
 
-    original_norms = torch.load(os.path.join(ckpt_dir, "original_norms.pt"), map_location="cpu")
     step = int(trainer_state.get("step", 0))
     epoch = int(trainer_state.get("epoch", 0))
     saved_args = cast(Dict[str, Any], trainer_state.get("args", {}))
     logging.info(f"Resumed from {ckpt_dir}: step={step}, epoch={epoch}, trainable_tensors={loaded}")
-    return step, epoch, original_norms, saved_args
+    return step, epoch, saved_args
 
 
 # ============================================================
@@ -468,7 +420,7 @@ class InfiniteTalkDataset(Dataset):
     def __init__(
             self,
             data_dir,
-            frame_num=17,
+            frame_num=33,
             target_size=(832, 480),
             audio_window=5,
             ref_neighbor_frames: int = 25,
@@ -522,11 +474,11 @@ class InfiniteTalkDataset(Dataset):
         full_audio_emb = torch.load(audio_emb_path, map_location='cpu')
         total_audio_frames = full_audio_emb.shape[0]
 
-        # We need self.frame_num frames for the main training segment.
-        # For continuation mode with Eq.(3) concat, context and target should be non-overlapping:
-        # context = 9 frames (indices 0..8), target starts at frame 9.
+        # We need self.frame_num frames for the entire training segment.
+        # To perfectly mirror inference sliding window size, the total window is fixed.
+        # For continuation mode, context (9 frames) and target (remaining frames) share this window.
         context_frames = 9
-        needed_frames = context_frames + self.frame_num
+        needed_frames = self.frame_num
         max_start = max(0, total_audio_frames - needed_frames - 5)
         start_frame = random.randint(0, max_start) if max_start > 0 else 0
 
@@ -648,48 +600,75 @@ def train(args):
     logging.info("Offloaded vae / clip / text_encoder to CPU")
 
     # ---- Quantize frozen base model to reduce VRAM ----
-    if args.quant == 'int8':
-        from optimum.quanto import quantize, freeze, qint8
-        logging.info("Quantizing frozen base model to INT8 before applying LoRA...")
-        quantize(model, weights=qint8)
-        freeze(model)
-        logging.info(f"Memory after model.to & freeze: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
-        logging.info("INT8 quantization applied and base layers moved to device.")
+    if args.quant == 'fp8':
+        logging.info("Quantizing frozen base model to FP8 (float8_e4m3fn) + monkey patch a la musubi-tuner...")
+        max_val = torch.finfo(torch.float8_e4m3fn).max
+        min_val = -max_val
+        quantized_count = 0
+        from torch.nn import functional as F
+        
+        # We need to wrap the forward method for monkey patching FP8
+        def make_fp8_forward(module):
+            def fp8_forward(x):
+                # Dequantize weight dynamically for the forward pass, using the same dtype as input
+                dequantized_weight = (module.weight.to(x.dtype) * module.scale_weight.to(x.dtype))
+                bias = module.bias.to(x.dtype) if module.bias is not None else None
+                return F.linear(x, dequantized_weight, bias)
+            return fp8_forward
+            
+        for name, module in model.named_modules():
+            if isinstance(module, torch.nn.Linear):
+                # We skip layers that will be LoRA adapted if they need to be strictly BF16? 
+                # Actually, LoRA replaces Linear with LoRALinear which adds adapters to this base layer. 
+                # The base layer stays frozen. So quantizing it is perfect!
+                weight_data = module.weight.data.float()
+                
+                # Per-tensor quantization
+                tensor_max = torch.max(torch.abs(weight_data).view(-1))
+                scale = tensor_max / max_val
+                scale = torch.clamp(scale, min=1e-8)
+                
+                quantized_weight = (weight_data / scale).clamp_(min=min_val, max=max_val).to(torch.float8_e4m3fn)
+                
+                # Replace module weights
+                module.weight = torch.nn.Parameter(quantized_weight, requires_grad=False)
+                module.register_buffer("scale_weight", scale.to(torch.bfloat16))
+                
+                # Patch forward
+                module.forward = make_fp8_forward(module)
+                quantized_count += 1
+                
+                if module.bias is not None:
+                    module.bias.data = module.bias.data.to(torch.bfloat16)
+                    
+        logging.info(f"FP8 quantization applied to {quantized_count} linear layers. Memory: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
+    elif args.quant == 'int8':
+        # Default to bitsandbytes for int8 if requested instead of quanto
+        import bitsandbytes as bnb
+        logging.info("Int8 not directly supported via native patch here, defaulting to BF16 or try `fp8`")
+        
+    torch.cuda.empty_cache()
+    gc.collect()
 
     # ---- Freeze everything (re-verify after quantization) ----
     for param in model.parameters():
         param.requires_grad = False
 
-    total_trainable = count_trainable(model)
-    logging.info(f"2 Total trainable parameters: {total_trainable:,}")
-    # ---- Apply LoRA to Linear layers ----
+    # ---- Apply LoRA to Linear layers (norms remain frozen, following musubi-tuner convention) ----
     target_modules = args.target_modules.split(',') if args.target_modules else None
     model = apply_lora_to_model(model, rank=args.lora_rank, alpha=args.lora_alpha,
                                 target_modules=target_modules)
-
-    total_trainable = count_trainable(model)
-    logging.info(f"3 Total trainable parameters: {total_trainable:,}")
-    # ---- Unfreeze small norms for direct training (too small for LoRA) ----
-    original_norms = unfreeze_small_norms(model)
-
-    total_trainable = count_trainable(model)
-    logging.info(f"4 Total trainable parameters: {total_trainable:,}")
 
     torch.cuda.empty_cache()
     gc.collect()
     model = model.to(device)
     model.disable_teacache()
-    # Move trainable params to float32 for training stability
+    
+    # ---- Collect trainable parameters (keep in float32 for training stability) ----
     lora_params = []
     for name, param in model.named_parameters():
         if param.requires_grad:
-            # [Fix] Forward/Backward Type Alignment for 5090 (Quanto + BF16 AMP)
-            # Use BFloat16 instead of Float32 to avoid mismatched dtypes in Quanto backward pass.
-            if not str(param.data.dtype).startswith("torch.int"):
-                try:
-                    param.data = param.data.to(torch.bfloat16)
-                except:
-                    pass
+            # Keep LoRA adapters in float32 exactly like musubi-tuner for max stability
             lora_params.append(param)
             logging.info(f"  Trainable: {name} {param.shape} ({param.data.dtype})")
 
@@ -716,10 +695,6 @@ def train(args):
         optimizer, T_max=args.max_steps, eta_min=args.lr * 0.1
     )
 
-    # GradScaler is only for float16; bfloat16 has float32-range exponents and needs no scaling.
-    # Enabling it with bfloat16 + quanto INT8 causes float32 gradient promotion → dtype mismatch.
-    scaler = torch.amp.GradScaler('cuda', enabled=False)
-
     tb_log_dir = args.tensorboard_dir or os.path.join(args.output_dir, "tensorboard")
     writer: Optional[Any] = None
     if args.tensorboard:
@@ -733,12 +708,11 @@ def train(args):
     if args.resume_from:
         if not os.path.exists(args.resume_from):
             raise FileNotFoundError(f"--resume_from not found: {args.resume_from}")
-        current_step, epoch, original_norms, saved_args = load_training_checkpoint(
+        current_step, epoch, saved_args = load_training_checkpoint(
             args.resume_from,
             model,
             optimizer,
             scheduler,
-            scaler,
             strict=args.resume_strict,
         )
         os.makedirs(args.output_dir, exist_ok=True)
@@ -816,19 +790,19 @@ def train(args):
                         ref_frame_cpu = ref_frame.unsqueeze(1).to('cpu')
                         
                         x_1 = vae.encode([video_target_cpu])[0].to(device)  # C_lat, T_target, lat_h, lat_w
-                        x_0 = vae.encode([ref_frame_cpu])[0].to(device)    # C_lat, 1, lat_h, lat_w
-                        
                     x_context = None
-                    total_latents = x_0.shape[1] + x_1.shape[1]
-                    audio_input = audio_emb_full[:total_latents].unsqueeze(0).to(torch.bfloat16)
+                    total_latents = x_1.shape[1]  # Must match x_t exactly. ref_latent sits at index 0 of this timeline.
+                    # The reference frame (x_0) is purely for y_cond spatial layout. 
+                    # The audio track matches 1:1 with the pixel frames of the target video.
+                    audio_input = audio_emb_full[:target_frames].unsqueeze(0).to(torch.bfloat16)
                 else:
                     # Continuation clip: Eq.(3) uses explicit temporal concatenation.
-                    # context frames = 4*(tc-1)+1 (paper uses 9 frames when tc=3), target frames = frame_num
-                    # Use non-overlapping concat as in Eq.(3): target starts after context.
-                    # [VRAM Fix] VAE/CLIP are already on CPU. Move inputs to CPU, then results to GPU.
+                    # Total sequence length MUST be identical to inference (where it predicts frame_num - context).
+                    # This implies target_frames = full window - context_frames.
+                    target_frames = args.frame_num - context_frames
                     with torch.no_grad():
                         video_context_cpu = video_full[:, :context_frames].to('cpu')
-                        video_target_cpu = video_full[:, context_frames: context_frames + target_frames].to('cpu')
+                        video_target_cpu = video_full[:, context_frames:].to('cpu')
                         
                         x_context = vae.encode([video_context_cpu])[0].to(device)  # C_lat, T_context, lat_h, lat_w
                         x_1 = vae.encode([video_target_cpu])[0].to(device)  # C_lat, T_target, lat_h, lat_w
@@ -838,8 +812,8 @@ def train(args):
                     gc.collect()
 
                     total_latents = x_context.shape[1] + x_1.shape[1]
-                    # Audio length should align with concatenated z1 timeline.
-                    audio_input = audio_emb_full[:context_frames + target_frames].unsqueeze(0).to(torch.bfloat16)
+                    # Audio length must identically align with the exact sequence loaded (args.frame_num)
+                    audio_input = audio_emb_full[:args.frame_num].unsqueeze(0).to(torch.bfloat16)
 
                 C_lat, _, lat_h, lat_w = x_1.shape[0], x_1.shape[1], x_1.shape[2], x_1.shape[3]
 
@@ -892,7 +866,8 @@ def train(args):
             t_shifted = t_frac * num_timesteps
 
             x_t = cast(torch.Tensor, t_frac.view(1, 1, 1, 1) * x_0 + (1 - t_frac).view(1, 1, 1, 1) * x_1)
-            target = x_1 - x_0
+            # Velocity target = noise - data (same convention as musubi-tuner and inference's -noise_pred).
+            target = x_0 - x_1
 
             if is_continuation:
                 # Eq.(3): z1 = concat(x_context, x_t)
@@ -931,6 +906,15 @@ def train(args):
             T_total = x_input.shape[1]
             max_seq_len = T_total * lat_h * lat_w // (patch_size[1] * patch_size[2])
 
+            # Gradient checkpointing requires at least one input with requires_grad=True
+            # for each checkpointed segment to properly recompute activations (musubi-tuner convention).
+            if args.gradient_checkpointing:
+                x_input.requires_grad_(True)
+                for t_ctx in context_list:
+                    t_ctx.requires_grad_(True)
+                y_cond.requires_grad_(True)
+                clip_fea.requires_grad_(True)
+
             with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=args.use_amp):
                 pred = model(
                     x=[x_input], t=t_shifted, context=context_list, seq_len=max_seq_len,
@@ -939,14 +923,12 @@ def train(args):
                 loss = F.mse_loss(pred.float() * loss_mask, target_full.float() * loss_mask) / loss_mask.mean()
 
             # ---- Backward ----
-            scaler.scale(loss).backward()
+            loss.backward()
             grad_norm_val: Optional[torch.Tensor] = None
             if args.max_grad_norm > 0:
-                scaler.unscale_(optimizer)
                 grad_norm_val = torch.nn.utils.clip_grad_norm_(lora_params, args.max_grad_norm)
 
-            scaler.step(optimizer)
-            scaler.update()
+            optimizer.step()
             scheduler.step()
 
             current_step = cast(int, current_step + 1)
@@ -959,7 +941,6 @@ def train(args):
                 writer.add_scalar("train/is_continuation", 1.0 if is_continuation else 0.0, current_step)
                 writer.add_scalar("train/cfg_drop_text", 1.0 if drop_text else 0.0, current_step)
                 writer.add_scalar("train/cfg_drop_audio", 1.0 if drop_audio else 0.0, current_step)
-                writer.add_scalar("train/amp_scale", scaler.get_scale(), current_step)
                 if grad_norm_val is not None:
                     writer.add_scalar("train/grad_norm", float(grad_norm_val), current_step)
                 writer.flush()
@@ -982,10 +963,8 @@ def train(args):
                     current_step,
                     epoch,
                     model,
-                    original_norms,
                     optimizer,
                     scheduler,
-                    scaler,
                     args,
                 )
                 logging.info(f"Saved checkpoint adapter: {adapter_path}")
@@ -1005,10 +984,8 @@ def train(args):
         current_step,
         epoch,
         model,
-        original_norms,
         optimizer,
         scheduler,
-        scaler,
         args,
         suffix="final",
     )
@@ -1053,8 +1030,8 @@ def parse_args():
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--max_steps", type=int, default=1000)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
-    parser.add_argument("--frame_num", type=int, default=17,
-                        help="Frames per training clip (4n+1). Use 17 for 5090.")
+    parser.add_argument("--frame_num", type=int, default=33,
+                        help="Frames per training clip (4n+1). Use 33 for 5090.")
     parser.add_argument(
         "--ref_neighbor_frames",
         type=int,
