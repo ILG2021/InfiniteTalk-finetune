@@ -61,8 +61,8 @@ python train_lora.py \
     --infinitetalk_dir weights/InfiniteTalk/single/infinitetalk.safetensors \
     --data_dir ./training_data \
     --quant fp8 \
-    --lora_rank 16 \
-    --lora_alpha 16 \
+    --lora_rank 32 \
+    --lora_alpha 32 \
     --lr 5e-5 \
     --max_steps 1000 \
     --frame_num 49 \
@@ -90,7 +90,7 @@ python train_lora.py \
 - `--ref_neighbor_frames`: 参考帧采样窗口（单位：帧）。训练时参考帧会从当前片段左右相邻区域采样（论文 M3 思路），避免控制过强/过弱。默认 25（约 1 秒）。
 - `--cfg_drop_text_prob / --cfg_drop_audio_prob / --cfg_drop_both_prob`: CFG dropout 概率，用于让推理侧 Text/Audio CFG 更稳定、可控。三者之和必须小于等于 1。
 - `--debug_assert_shapes`: 首次开训建议打开，用于强制检查音频长度与 latent 时间轴对齐，避免 silent shape mismatch。
-- `--lora_rank / --lora_alpha`: **推荐为 16**。如果显存充裕可以提升至 `32` 以增强人物面部还原度。
+- `--lora_rank / --lora_alpha`: **首选推荐为 32**。Wan2.1 是 14B 参数级别的大模型，16 的参数容量在面部微表情还原上可能感到吃力。由于仅微调 cross-attention 和音频映射层，从 16 提升到 32 或 64 对 5090 显存增加不到数百兆，完全可以大胆拉高。如果人物仍嫌不像，可进一步上调至 `64`。
 - `--quant fp8`: **必须开启**。使用 FP8 Monkey Patch 加速并极大压缩 base 模型显存，是 RTX 5090 运行 14B 模型的关键。
 - `--lr`: **推荐 5e-5 ~ 1e-4**。与全参微调不同，LoRA 容许适当使用偏大一点的学习率进行初期收敛。 
 
