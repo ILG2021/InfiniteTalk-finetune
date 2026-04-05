@@ -14,6 +14,7 @@ from diffusers.configuration_utils import ConfigMixin, register_to_config
 from .attention import flash_attention, SingleStreamMutiAttention
 from ..utils.multitalk_utils import get_attn_map_with_target
 import logging
+from ..utils.offload_utils import ModelOffloader, _clean_memory_on_device
 try:
     from sageattention import sageattn
     USE_SAGEATTN = True
@@ -535,7 +536,6 @@ class WanModel(ModelMixin, ConfigMixin):
         else:
             raise NotImplementedError('Not supported model type.')
         
-        # init audio adapter
         self.audio_proj = AudioProjModel(
                     seq_len=audio_window,
                     seq_len_vf=audio_window+vae_scale-1,
@@ -545,11 +545,33 @@ class WanModel(ModelMixin, ConfigMixin):
                     norm_output_audio=norm_output_audio,
                 )
 
+        self.blocks_to_swap = None
+        self.offloader = None
 
         # initialize weights
         if weight_init:
             self.init_weights()
             
+    def enable_block_swap(self, blocks_to_swap: int, device: torch.device, supports_backward: bool, use_pinned_memory: bool = False):
+        self.blocks_to_swap = blocks_to_swap
+        self.num_blocks = len(self.blocks)
+
+        assert (
+            self.blocks_to_swap <= self.num_blocks - 1
+        ), f"Cannot swap more than {self.num_blocks - 1} blocks. Requested {self.blocks_to_swap} blocks to swap."
+
+        self.offloader = ModelOffloader(
+            "wan_attn_block", self.blocks, self.num_blocks, self.blocks_to_swap, supports_backward, device, use_pinned_memory  # , debug=True
+        )
+        print(
+            f"WanModel: Block swap enabled. Swapping {self.blocks_to_swap} blocks out of {self.num_blocks} blocks. Supports backward: {supports_backward}"
+        )
+
+    def prepare_block_swap_before_forward(self):
+        if self.blocks_to_swap is None or self.blocks_to_swap == 0:
+            return
+        self.offloader.prepare_block_devices_before_forward(self.blocks)
+
     def init_freqs(self):
         d = self.dim // self.num_heads
         self.freqs = torch.cat([
@@ -763,12 +785,24 @@ class WanModel(ModelMixin, ConfigMixin):
                         x = block(x, **kwargs)
                     self.previous_residual_uncond = x - ori_x
         else:
-            for block in self.blocks:
+            if getattr(self, "blocks_to_swap", None):
+                _clean_memory_on_device(x.device)
+            input_device = x.device
+            for block_idx, block in enumerate(self.blocks):
+                if getattr(self, "blocks_to_swap", None):
+                    self.offloader.wait_for_block(block_idx)
+                
                 if self.gradient_checkpointing and torch.is_grad_enabled():
                     x = torch.utils.checkpoint.checkpoint(
                         block, x, use_reentrant=False, **kwargs)
                 else:
                     x = block(x, **kwargs)
+                    
+                if getattr(self, "blocks_to_swap", None):
+                    self.offloader.submit_move_blocks_forward(self.blocks, block_idx)
+
+            if x.device != input_device:
+                x = x.to(input_device)
 
         # head
         x = self.head(x, e)

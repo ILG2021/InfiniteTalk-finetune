@@ -6,6 +6,7 @@
 创建一个python 3.10虚拟环境
 ```bash
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+pip install bitsandbytes
 pip install -r requirements.txt
 
 huggingface-cli download Wan-AI/Wan2.1-I2V-14B-480P --local-dir ./weights/Wan2.1-I2V-14B-480P
@@ -47,9 +48,10 @@ python prepare_data.py \
     --prompt "A person is talking." \
     --device cuda:0 \
     --target_h 832 \
-    --target_w 540
+    --target_w 528
 ```
 > **输出规范**：该脚本会在 `./training_data` 目录下生成统一的 `videos` 和处理后的 `audio_embs` 及 `metadata.json`，这就是下一步的训练数据集。
+> **注**：宽高必须是16的倍数，否则会报错。
 
 ## 3. 启动训练
 
@@ -67,12 +69,13 @@ python train_lora.py \
     --max_steps 1000 \
     --frame_num 49 \
     --target_h 832 \
-    --target_w 540 \
+    --target_w 528 \
     --ref_neighbor_frames 25 \
     --cfg_drop_text_prob 0.1 \
     --cfg_drop_audio_prob 0.1 \
     --cfg_drop_both_prob 0.05 \
-    --debug_assert_shapes \
+    --use_8bit_optim \
+    --blocks_to_swap 10 \
     --gradient_checkpointing \
     --use_amp \
     --output_dir output/my_lora \
@@ -81,7 +84,11 @@ python train_lora.py \
     --debug_assert_shapes
 ```
 
+> **注**：宽高必须是16的倍数，否则会报错。
+
 ### 参数建议：
+- `--blocks_to_swap`: **显存救星，强烈建议开启**。默认为 0。如果你在使用 RTX 5090 (32G)、4090 (24G) 运行 49 帧及以上长序列时遇到 OOM，请务必设置此值（建议 20 到 35 之间）。它会将指定数量的 DiT Block 参数常驻卸载到系统内存中并在计算时流水线加载，用轻微的速度损耗换取巨大的显存空间。
+- `--use_8bit_optim`: **强烈建议开启**。调用 `bitsandbytes` 使用 8-bit AdamW 替代传统 32-bit 优化器，能进一步压缩优化器状态体积，对低显存设备极佳。
 - `--frame_num`: **强烈建议设为 33 或 49**。
     - **33 (非常稳定)**: 约占 20-22GB 显存，适合后台运行。
     - **49 (推荐/画质优先)**: 约占 25-27GB 显存，涵盖近 2 秒视频，能学到更好的连贯性。

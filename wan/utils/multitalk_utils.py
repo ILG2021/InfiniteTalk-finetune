@@ -76,72 +76,101 @@ def normalize_and_scale(column, source_range, target_range, epsilon=1e-8):
     return scaled
 
 
-@torch.compile
-def calculate_x_ref_attn_map(visual_q, ref_k, ref_target_masks, mode='mean', attn_bias=None):
-    
-    ref_k = ref_k.to(visual_q.dtype).to(visual_q.device)
-    scale = 1.0 / visual_q.shape[-1] ** 0.5
-    visual_q = visual_q * scale
-    visual_q = visual_q.transpose(1, 2)
-    ref_k = ref_k.transpose(1, 2)
-    attn = visual_q @ ref_k.transpose(-2, -1)
+# NOTE: @torch.compile removed — it causes inductor to allocate the full
+# [B, H, all_tokens, ref_tokens] buffer as a single contiguous block during
+# the gradient-checkpoint recompute pass, which blows up VRAM for long seqs.
+def calculate_x_ref_attn_map_chunk(visual_q_chunk, ref_k_chunk, ref_target_masks, mode='mean'):
+    """Compute attn map for a SINGLE temporal chunk (one frame's tokens).
 
-    if attn_bias is not None:
-        attn = attn + attn_bias
+    Args:
+        visual_q_chunk: [B, frame_tokens, H, D]  (already head-split)
+        ref_k_chunk:    [B, ref_tokens,   H, D]  (already head-split)
+        ref_target_masks: [class_num, ref_tokens]
+    Returns:
+        [class_num, B, frame_tokens]
+    """
+    ref_k_chunk = ref_k_chunk.to(visual_q_chunk.dtype).to(visual_q_chunk.device)
+    scale = 1.0 / visual_q_chunk.shape[-1] ** 0.5
 
-    x_ref_attn_map_source = attn.softmax(-1) # B, H, x_seqlens, ref_seqlens
+    # [B, H, frame_tokens, D] @ [B, H, D, ref_tokens] -> [B, H, frame_tokens, ref_tokens]
+    q = visual_q_chunk.transpose(1, 2) * scale   # B, H, frame_tokens, D
+    k = ref_k_chunk.transpose(1, 2)              # B, H, ref_tokens,   D
+    attn = (q @ k.transpose(-2, -1)).softmax(-1)  # B, H, frame_tokens, ref_tokens
 
-
+    ref_target_masks = ref_target_masks.to(attn.dtype)  # class_num, ref_tokens
     x_ref_attn_maps = []
-    ref_target_masks = ref_target_masks.to(visual_q.dtype)
-    x_ref_attn_map_source = x_ref_attn_map_source.to(visual_q.dtype)
-
-    for class_idx, ref_target_mask in enumerate(ref_target_masks):
-        torch_gc()
-        ref_target_mask = ref_target_mask[None, None, None, ...]
-        x_ref_attnmap = x_ref_attn_map_source * ref_target_mask
-        x_ref_attnmap = x_ref_attnmap.sum(-1) / ref_target_mask.sum() # B, H, x_seqlens, ref_seqlens --> B, H, x_seqlens
-        x_ref_attnmap = x_ref_attnmap.permute(0, 2, 1) # B, x_seqlens, H
-       
+    for ref_mask in ref_target_masks:
+        # ref_mask: [ref_tokens] -> [1, 1, 1, ref_tokens]
+        mask = ref_mask[None, None, None, :]  
+        masked = (attn * mask).sum(-1) / (ref_mask.sum() + 1e-8)  # B, H, frame_tokens
+        masked = masked.permute(0, 2, 1)  # B, frame_tokens, H
         if mode == 'mean':
-            x_ref_attnmap = x_ref_attnmap.mean(-1) # B, x_seqlens
+            masked = masked.mean(-1)   # B, frame_tokens
         elif mode == 'max':
-            x_ref_attnmap = x_ref_attnmap.max(-1) # B, x_seqlens
-        
-        x_ref_attn_maps.append(x_ref_attnmap)
-    
-    del attn
-    del x_ref_attn_map_source
-    torch_gc()
+            masked = masked.max(-1).values
+        x_ref_attn_maps.append(masked)  # B, frame_tokens
 
-    return torch.concat(x_ref_attn_maps, dim=0)
+    del attn
+    return torch.stack(x_ref_attn_maps, dim=0)  # class_num, B, frame_tokens
 
 
 def get_attn_map_with_target(visual_q, ref_k, shape, ref_target_masks=None, split_num=2, enable_sp=False):
-    """Args:
-        query (torch.tensor): B M H K
-        key (torch.tensor): B M H K
-        shape (tuple): (N_t, N_h, N_w)
-        ref_target_masks: [B, N_h * N_w]
-    """
+    """Compute per-class reference attention maps WITHOUT allocating a
+    [B, H, all_tokens, ref_tokens] full-sequence matrix.
 
+    Instead we:
+      1. Restrict ref_k to the first-frame spatial tokens (N_h*N_w).
+      2. Iterate over time-frames (each N_h*N_w tokens) one at a time.
+      3. Within each frame further split over head groups (split_num).
+
+    Peak intermediate tensor is  [B, H/split_num, N_h*N_w, N_h*N_w]
+    which is constant regardless of the total number of frames.
+
+    Args:
+        visual_q (Tensor): [B, N_t*N_h*N_w, H, D]
+        ref_k    (Tensor): [B, N_h*N_w,     H, D]
+        shape    (tuple):  (N_t, N_h, N_w)
+        ref_target_masks (Tensor): [class_num, N_h*N_w]
+        split_num (int): head split factor
+        enable_sp (bool): sequence-parallel gather
+    Returns:
+        Tensor: [class_num, B*N_t*N_h*N_w]  — same layout as before
+    """
     N_t, N_h, N_w = shape
     if enable_sp:
         ref_k = get_sp_group().all_gather(ref_k, dim=1)
-    
-    x_seqlens = N_h * N_w
-    ref_k     = ref_k[:, :x_seqlens]
-    _, seq_lens, heads, _ = visual_q.shape
-    class_num, _ = ref_target_masks.shape
-    x_ref_attn_maps = torch.zeros(class_num, seq_lens).to(visual_q.device).to(visual_q.dtype)
 
+    frame_tokens = N_h * N_w
+    ref_k = ref_k[:, :frame_tokens]          # [B, frame_tokens, H, D]
+    _, seq_lens, heads, head_dim = visual_q.shape
+    class_num = ref_target_masks.shape[0]
     split_chunk = heads // split_num
-    
-    for i in range(split_num):
-        x_ref_attn_maps_perhead = calculate_x_ref_attn_map(visual_q[:, :, i*split_chunk:(i+1)*split_chunk, :], ref_k[:, :, i*split_chunk:(i+1)*split_chunk, :], ref_target_masks)
-        x_ref_attn_maps += x_ref_attn_maps_perhead
-    
-    return x_ref_attn_maps / split_num
+
+    # Output buffer accumulates over head-splits, then over frames
+    x_ref_attn_maps = torch.zeros(class_num, seq_lens,
+                                   device=visual_q.device, dtype=visual_q.dtype)
+
+    for f in range(N_t):
+        start = f * frame_tokens
+        end   = start + frame_tokens
+        q_f   = visual_q[:, start:end, :, :]   # B, frame_tokens, H, D
+
+        acc_f = torch.zeros(class_num, frame_tokens,
+                            device=visual_q.device, dtype=visual_q.dtype)
+        for i in range(split_num):
+            hs = i * split_chunk
+            he = hs + split_chunk
+            chunk_map = calculate_x_ref_attn_map_chunk(
+                q_f[:, :, hs:he, :],
+                ref_k[:, :, hs:he, :],
+                ref_target_masks,
+            )  # class_num, B, frame_tokens
+            # Squeeze B=1 and accumulate
+            acc_f += chunk_map[:, 0, :]   # class_num, frame_tokens
+
+        x_ref_attn_maps[:, start:end] = acc_f / split_num
+
+    return x_ref_attn_maps
 
 
 def rotate_half(x):

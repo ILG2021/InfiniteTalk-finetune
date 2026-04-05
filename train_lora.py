@@ -35,6 +35,7 @@ from wan.modules.multitalk_model import (
     WanModel, sinusoidal_embedding_1d, rope_params, rope_apply,
     AudioProjModel, WanLayerNorm, WanRMSNorm
 )
+from wan.utils.offload_utils import ModelOffloader, _clean_memory_on_device
 
 
 # ============================================================
@@ -664,6 +665,10 @@ def train(args):
     model = model.to(device)
     model.disable_teacache()
     
+    if hasattr(args, "blocks_to_swap") and args.blocks_to_swap > 0:
+        model.enable_block_swap(args.blocks_to_swap, device, supports_backward=True)
+        model.prepare_block_swap_before_forward()
+    
     # ---- Collect trainable parameters (keep in float32 for training stability) ----
     lora_params = []
     for name, param in model.named_parameters():
@@ -688,7 +693,16 @@ def train(args):
         logging.info("Gradient checkpointing: FULLY ENABLED (Instance + Patch)")
 
     # ---- Optimizer ----
-    optimizer = torch.optim.AdamW(lora_params, lr=args.lr, weight_decay=args.weight_decay)
+    if getattr(args, "use_8bit_optim", False):
+        try:
+            import bitsandbytes as bnb
+            optimizer = bnb.optim.AdamW8bit(lora_params, lr=args.lr, weight_decay=args.weight_decay)
+            logging.info("Using 8-bit AdamW optimizer from bitsandbytes.")
+        except ImportError:
+            logging.warning("bitsandbytes not installed. Falling back to regular AdamW.")
+            optimizer = torch.optim.AdamW(lora_params, lr=args.lr, weight_decay=args.weight_decay)
+    else:
+        optimizer = torch.optim.AdamW(lora_params, lr=args.lr, weight_decay=args.weight_decay)
 
     # ---- LR Scheduler ----
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -1038,6 +1052,8 @@ def parse_args():
         default=25,
         help="Reference frame sampling window (in frames) around the current segment; used for adjacent-frame sampling.",
     )
+    parser.add_argument("--use_8bit_optim", action=argparse.BooleanOptionalAction, default=True, help="Use bitsandbytes 8-bit optimizer to save VRAM on optimizer states")
+    parser.add_argument("--blocks_to_swap", type=int, default=0, help="Number of frozen transformer blocks to swap to CPU during forward/backward to save VRAM (max num_blocks-1)")
     parser.add_argument("--first_clip_prob", type=float, default=0.2,
                         help="Probability of sampling first-clip training branch. Continuation prob is 1-p.")
     parser.add_argument("--target_h", type=int, default=832,
