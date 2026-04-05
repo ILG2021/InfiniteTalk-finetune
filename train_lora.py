@@ -591,9 +591,9 @@ def train(args):
     )
 
     model = pipeline.model
-    # Offload VAE/CLIP/T5 to CPU to save VRAM for the DiT
+    # Offload CLIP/T5 to CPU to save VRAM for the DiT, but keep VAE on GPU (it's small but compute-heavy)
     vae = pipeline.vae
-    vae.to('cpu')  # WanVAE.to() moves model + mean/std/scale tensors together
+    vae.to(device)
     clip_model = pipeline.clip
     clip_model.model.to('cpu').float()  # float16 not supported on CPU, cast to float32
     text_encoder = pipeline.text_encoder
@@ -800,10 +800,10 @@ def train(args):
                 if not is_continuation:
                     # First clip: no context
                     with torch.no_grad():
-                        video_target_cpu = video_full[:, :target_frames].to('cpu')
-                        ref_frame_cpu = ref_frame.unsqueeze(1).to('cpu')
+                        video_target_device = video_full[:, :target_frames].to(device)
+                        ref_frame_device = ref_frame.unsqueeze(1).to(device)
                         
-                        x_1 = vae.encode([video_target_cpu])[0].to(device)  # C_lat, T_target, lat_h, lat_w
+                        x_1 = vae.encode([video_target_device])[0]  # C_lat, T_target, lat_h, lat_w
                     x_context = None
                     total_latents = x_1.shape[1]  # Must match x_t exactly. ref_latent sits at index 0 of this timeline.
                     # The reference frame (x_0) is purely for y_cond spatial layout. 
@@ -815,11 +815,11 @@ def train(args):
                     # This implies target_frames = full window - context_frames.
                     target_frames = args.frame_num - context_frames
                     with torch.no_grad():
-                        video_context_cpu = video_full[:, :context_frames].to('cpu')
-                        video_target_cpu = video_full[:, context_frames:].to('cpu')
+                        video_context_device = video_full[:, :context_frames].to(device)
+                        video_target_device = video_full[:, context_frames:].to(device)
                         
-                        x_context = vae.encode([video_context_cpu])[0].to(device)  # C_lat, T_context, lat_h, lat_w
-                        x_1 = vae.encode([video_target_cpu])[0].to(device)  # C_lat, T_target, lat_h, lat_w
+                        x_context = vae.encode([video_context_device])[0]  # C_lat, T_context, lat_h, lat_w
+                        x_1 = vae.encode([video_target_device])[0]  # C_lat, T_target, lat_h, lat_w
                     
                     # [VRAM Maintenance]
                     torch.cuda.empty_cache()
@@ -833,8 +833,8 @@ def train(args):
 
                 # Build reference condition z2 + mask m directly in latent space to match total_latents.
                 with torch.no_grad():
-                    ref_frame_cpu = ref_frame.unsqueeze(1).to('cpu')
-                    ref_latent = vae.encode([ref_frame_cpu])[0].to(device)  # C_lat, 1, lat_h, lat_w
+                    ref_frame_device = ref_frame.unsqueeze(1).to(device)
+                    ref_latent = vae.encode([ref_frame_device])[0]  # C_lat, 1, lat_h, lat_w
                 
                 y_latent = torch.zeros(C_lat, total_latents, lat_h, lat_w, device=device, dtype=ref_latent.dtype)
                 y_latent[:, :1] = ref_latent
