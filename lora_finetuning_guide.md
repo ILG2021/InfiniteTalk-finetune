@@ -22,8 +22,10 @@ huggingface-cli download MeiGen-AI/InfiniteTalk single/infinitetalk.safetensors 
 
 1. **基础模型 FP8 量化**：加载基础权重后，使用 FP8 精度进行计算，极大降低显存占用。
 2. **LoRA 微调策略**：
-    - 我们采用 **纯 LoRA (Low-Rank Adaptation)** 策略。针对底座模型中新增的音频投影层 (`audio_proj`) 和所有 40 层 blocks 的音频交叉注意力层 (`audio_cross_attn`) 中的线性层进行低秩适配。
-    - 底座权重保持冻结并量化，LoRA 参数以 FP32 训练并在导出时合并缩放系数 (scaling)，确保与推理侧脚本 (`wan_lora.py`) 完全匹配。
+    - 我们采用 **纯 LoRA (Low-Rank Adaptation)** 策略。
+    - **音频同步与动作驱动**：针对底座模型中新增的音频投影层 (`audio_proj`) 和音频交叉注意力层 (`audio_cross_attn`) 中的线性层进行低秩适配，让模型学会如何对齐当前专属人物的口型细节。
+    - **人物ID克隆与“多动症”镇压（核心）**：为了真正还原长相不仅形似更要神似，并在说话时稳如泰山，我们全面将视觉注意力核心层（`self_attn`, `cross_attn`）和记忆层（`ffn.0`, `ffn.2`）纳入训练目标。这能强行覆盖（洗脑）Wan 2.1 底模中自带的“说话必须挥手晃脑”的短视频博主先验。
+    - 底座剩余权重保持冻结并量化，LoRA 参数以 FP32 训练并在导出时合并缩放系数 (scaling)，确保与推理侧完全匹配。
 
 ## 2. 数据准备
 
@@ -45,12 +47,13 @@ python prepare_data.py \
     --video_dir ./raw_videos \
     --output_dir ./training_data \
     --wav2vec_model weights/chinese-wav2vec2-base \
-    --prompt "A person is talking." \
+    --prompt "A news anchor is broadcasting." \
     --device cuda:0 \
     --target_h 832 \
     --target_w 528
 ```
-> **输出规范**：该脚本会在 `./training_data` 目录下生成统一的 `videos` 和处理后的 `audio_embs` 及 `metadata.json`，这就是下一步的训练数据集。
+> **输出规范与同步保障**：该脚本会统一将帧率严格重采样为 25fps，并强制将音频转码为高兼容、精确对齐时间戳的 `aac` 格式，彻底解决了 Windows 自带播放器报 `ipcm` 错误导致的无声或噪音乱码问题。最终生成统一的 `videos`、`audio_embs` 及 `metadata.json`。
+> **提示词（Prompt）秘籍**：千万别再使用泛泛而谈的 `A person is talking.`！由于底模本身表现欲极强，提示词一定要往端庄、安静、冷感的方向引导，比如使用 `A professional news anchor is broadcasting, sitting completely still, hands kept down.`。正向精准词+训练强大的视觉 LoRA，能彻底根治生成的视频乱挥手的问题。
 > **注**：宽高必须是16的倍数，否则会报错。
 
 ## 3. 启动训练
@@ -63,10 +66,10 @@ python train_lora.py \
     --infinitetalk_dir weights/InfiniteTalk/single/infinitetalk.safetensors \
     --data_dir ./training_data \
     --quant fp8 \
-    --lora_rank 32 \
-    --lora_alpha 32 \
-    --lr 5e-5 \
-    --max_steps 1000 \
+    --lora_rank 64 \
+    --lora_alpha 64 \
+    --lr 2e-5 \
+    --max_steps 1500 \
     --frame_num 49 \
     --target_h 832 \
     --target_w 528 \
@@ -75,11 +78,11 @@ python train_lora.py \
     --cfg_drop_audio_prob 0.1 \
     --cfg_drop_both_prob 0.05 \
     --use_8bit_optim \
-    --blocks_to_swap 10 \
+    --blocks_to_swap 25 \
     --gradient_checkpointing \
     --use_amp \
     --output_dir output/my_lora \
-    --save_every 200 \
+    --save_every 300 \
     --log_every 10 \
     --debug_assert_shapes
 ```
@@ -87,19 +90,19 @@ python train_lora.py \
 > **注**：宽高必须是16的倍数，否则会报错。
 
 ### 参数建议：
-- `--blocks_to_swap`: **显存救星，强烈建议开启**。默认为 0。如果你在使用 RTX 5090 (32G)、4090 (24G) 运行 49 帧及以上长序列时遇到 OOM，请务必设置此值（建议 20 到 35 之间）。它会将指定数量的 DiT Block 参数常驻卸载到系统内存中并在计算时流水线加载，用轻微的速度损耗换取巨大的显存空间。
+- `--blocks_to_swap`: **显存救星，强烈建议开启**。如果不开启，加入全局视觉特征层（self_attn/ffn）后会立刻爆显存。建议设置为 `20 到 35` 之间（如 25）。它会将指定数量的 DiT Block 参数暂存至内存，牺牲轻微的速度换取极大的显存空间。
 - `--use_8bit_optim`: **强烈建议开启**。调用 `bitsandbytes` 使用 8-bit AdamW 替代传统 32-bit 优化器，能进一步压缩优化器状态体积，对低显存设备极佳。
 - `--frame_num`: **强烈建议设为 33 或 49**。
     - **33 (非常稳定)**: 约占 20-22GB 显存，适合后台运行。
-    - **49 (推荐/画质优先)**: 约占 25-27GB 显存，涵盖近 2 秒视频，能学到更好的连贯性。
+    - **49 (推荐/画质优先)**: 约占 27-30GB 显存，涵盖近 2 秒视频，能学到更好的连贯性。
     - 注：帧数必须为 `4n+1`，如 17, 33, 49, 65...
-- `--target_h / --target_w`: 训练输入会被缩放到固定分辨率（默认为竖屏 `832x480`，即 `H=832, W=480`）。建议与你用 `prepare_data.py` 预处理的分辨率保持一致。
+- `--max_steps`: **推荐 1500 左右**。由于在 target_modules 里加入了视觉大层（全方位记忆和神态复刻），可训练参数翻了几倍，因而需要比原来单训嘴巴（1000步）稍长一点的训练时间才能把长相“吃透”。
+- `--target_h / --target_w`: 训练输入会被缩放到固定分辨率（默认为竖屏 `832x528`，即 `H=832, W=528`）。建议与你用 `prepare_data.py` 预处理的分辨率保持一致。
 - `--ref_neighbor_frames`: 参考帧采样窗口（单位：帧）。训练时参考帧会从当前片段左右相邻区域采样（论文 M3 思路），避免控制过强/过弱。默认 25（约 1 秒）。
-- `--cfg_drop_text_prob / --cfg_drop_audio_prob / --cfg_drop_both_prob`: CFG dropout 概率，用于让推理侧 Text/Audio CFG 更稳定、可控。三者之和必须小于等于 1。
-- `--debug_assert_shapes`: 首次开训建议打开，用于强制检查音频长度与 latent 时间轴对齐，避免 silent shape mismatch。
-- `--lora_rank / --lora_alpha`: **首选推荐为 32**。Wan2.1 是 14B 参数级别的大模型，16 的参数容量在面部微表情还原上可能感到吃力。由于仅微调 cross-attention 和音频映射层，从 16 提升到 32 或 64 对 5090 显存增加不到数百兆，完全可以大胆拉高。如果人物仍嫌不像，可进一步上调至 `64`。
+- `--cfg_drop_text_prob / --cfg_drop_audio_prob / --cfg_drop_both_prob`: CFG dropout 概率，三者之和必须小于等于 1。
+- `--lora_rank / --lora_alpha`: **强烈推荐提升为 64**。因为你现在彻底解冻了庞大的视觉全局通道（`self_attn`, `ffn`）来复刻精确的ID长相和皮肤质感，32 的容量可能在眼颊微表情上显得捉襟见肘。直接拉到 64 能赋予模型更强大的记忆“照片级细节”的能力。
 - `--quant fp8`: **必须开启**。使用 FP8 Monkey Patch 加速并极大压缩 base 模型显存，是 RTX 5090 运行 14B 模型的关键。
-- `--lr`: **推荐 5e-5 ~ 1e-4**。与全参微调不同，LoRA 容许适当使用偏大一点的学习率进行初期收敛。 
+- `--lr`: **强烈建议下调至 2e-5 或 1e-5**。这是极其关键的改动！你之前单训微小的音频层时用 `5e-5` 没问题；但现在你动了庞大且脆弱的**核心视觉物理层**，学习率一旦偏大，极易引发色彩崩塌、画面过曝或背景糊化等灾难。用 `2e-5` 文火慢炖，才是高端人像定制的最佳实践。 
 
 ## 4. 显存监控与排障
 
