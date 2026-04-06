@@ -193,7 +193,7 @@ def main():
     parser.add_argument("--wav2vec_model", type=str,
                         default="weights/chinese-wav2vec2-base",
                         help="wav2vec2 model name or path")
-    parser.add_argument("--prompt", type=str, default="A person is talking.",
+    parser.add_argument("--prompt", type=str, default="A news anchor is broadcasting.",
                         help="Default text prompt for all videos")
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--target_h", type=int, default=832,
@@ -253,7 +253,7 @@ def main():
                     '-vf', vf_filter,
                     '-r', '25',  # Standardize all videos to 25 FPS
                     '-c:v', 'libx264', '-preset', 'fast', '-crf', '18',
-                    '-c:a', 'copy',
+                    '-c:a', 'aac', '-b:a', '192k',
                     dst_video
                 ]
                 subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

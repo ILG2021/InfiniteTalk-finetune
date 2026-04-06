@@ -92,6 +92,20 @@ def apply_lora_to_model(model: nn.Module, rank: int = 16, alpha: float = 16.0,
     """
     if target_modules is None:
         target_modules = [
+            # Identity / Visual appearance pathways
+            'self_attn.q',
+            'self_attn.k',
+            'self_attn.v',
+            'self_attn.o',
+            'cross_attn.q',
+            'cross_attn.k',
+            'cross_attn.v',
+            'cross_attn.k_img',
+            'cross_attn.v_img',
+            'cross_attn.o',
+            'ffn.0',
+            'ffn.2',
+            # Audio-mouth sync pathways
             'audio_cross_attn.q_linear',
             'audio_cross_attn.kv_linear',
             'audio_cross_attn.proj',
@@ -469,7 +483,7 @@ class InfiniteTalkDataset(Dataset):
         sample = self.samples[idx]
         video_path = os.path.join(self.data_dir, 'videos', sample['video'])
         audio_emb_path = os.path.join(self.data_dir, 'audio_embs', sample['audio_emb'])
-        prompt = sample.get('prompt', 'A person is talking.')
+        prompt = sample.get('prompt', 'A news anchor is broadcasting.')
 
         # Load pre-computed audio embedding: [total_frames, 12, 768]
         full_audio_emb = torch.load(audio_emb_path, map_location='cpu')
@@ -817,11 +831,18 @@ def train(args):
                     # This implies target_frames = full window - context_frames.
                     target_frames = args.frame_num - context_frames
                     with torch.no_grad():
-                        video_context_device = video_full[:, :context_frames].to(device)
-                        video_target_device = video_full[:, context_frames:].to(device)
+                        # Encode all frames together to preserve temporal receptive field and avoid boundary artifacts
+                        # from the VAE's 3D convolutions at the cut point.
+                        video_combined_device = video_full[:, :args.frame_num].to(device)
+                        x_combined = vae.encode([video_combined_device])[0]  # C_lat, T_total, lat_h, lat_w
                         
-                        x_context = vae.encode([video_context_device])[0]  # C_lat, T_context, lat_h, lat_w
-                        x_1 = vae.encode([video_target_device])[0]  # C_lat, T_target, lat_h, lat_w
+                        # In pixel space, context_frames is 9. In the temporal latent space with stride 4:
+                        # latent_length = int(1 + (pixel_length - 1) // 4)
+                        # So 9 pixel frames = 3 latent frames.
+                        context_latent_frames = int(1 + (context_frames - 1) // 4)
+                        
+                        x_context = x_combined[:, :context_latent_frames]
+                        x_1 = x_combined[:, context_latent_frames:]
                     
                     # [VRAM Maintenance]
                     torch.cuda.empty_cache()
@@ -833,15 +854,29 @@ def train(args):
 
                 C_lat, _, lat_h, lat_w = x_1.shape[0], x_1.shape[1], x_1.shape[2], x_1.shape[3]
 
-                # Build reference condition z2 + mask m directly in latent space to match total_latents.
+                # Build reference condition z2 + mask m to exactly match total_latents.
                 with torch.no_grad():
-                    ref_frame_device = ref_frame.unsqueeze(1).to(device)
-                    ref_latent = vae.encode([ref_frame_device])[0]  # C_lat, 1, lat_h, lat_w
+                    # To exactly match unmodified inference, we must construct the condition
+                    # by padding the reference frame with zeros in pixel space and encoding it.
+                    ref_frame_batch = ref_frame.unsqueeze(0).unsqueeze(2).to(device)  # 1, C_img, 1, H, W
+                    pixel_frame_num = args.frame_num
+                    video_frames_pad = torch.zeros(
+                        1, 3, pixel_frame_num - 1, ref_frame.shape[1], ref_frame.shape[2], device=device
+                    )
+                    padding_frames_pixels = torch.cat([ref_frame_batch, video_frames_pad], dim=2)
+                    
+                    y = vae.encode(padding_frames_pixels)
+                    y_latent = torch.stack(y)[0]  # C_lat, T_lat, lat_h, lat_w
+                    
+                # Construct mask exactly matching inference logic
+                msk_inf = torch.ones(1, pixel_frame_num, lat_h, lat_w, device=device)
+                msk_inf[:, 1:] = 0
+                msk_inf = torch.concat([
+                    torch.repeat_interleave(msk_inf[:, 0:1], repeats=4, dim=1), msk_inf[:, 1:]
+                ], dim=1)
+                msk_inf = msk_inf.view(1, msk_inf.shape[1] // 4, 4, lat_h, lat_w)
+                msk = msk_inf.transpose(1, 2)[0]  # 4, T_lat, lat_h, lat_w
                 
-                y_latent = torch.zeros(C_lat, total_latents, lat_h, lat_w, device=device, dtype=ref_latent.dtype)
-                y_latent[:, :1] = ref_latent
-                msk = torch.zeros(4, total_latents, lat_h, lat_w, device=device, dtype=ref_latent.dtype)
-                msk[:, :1] = 1
                 y_cond = torch.cat([msk, y_latent], dim=0).to(torch.bfloat16)
 
             # ---- CLIP and Text (Shared) ----
