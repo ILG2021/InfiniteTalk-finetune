@@ -70,7 +70,7 @@ python train_lora.py \
     --lora_alpha 64 \
     --lr 2e-5 \
     --max_steps 1500 \
-    --frame_num 49 \
+    --frame_num 33 \
     --target_h 832 \
     --target_w 528 \
     --ref_neighbor_frames 25 \
