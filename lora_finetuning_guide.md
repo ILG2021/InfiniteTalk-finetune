@@ -49,8 +49,8 @@ python prepare_data.py \
     --wav2vec_model weights/chinese-wav2vec2-base \
     --prompt "A news anchor is broadcasting." \
     --device cuda:0 \
-    --target_h 1088 \
-    --target_w 688
+    --target_h 1024 \
+    --target_w 656
 ```
 > **输出规范与同步保障**：该脚本会统一将帧率严格重采样为 25fps，并强制将音频转码为高兼容、精确对齐时间戳的 `aac` 格式，彻底解决了 Windows 自带播放器报 `ipcm` 错误导致的无声或噪音乱码问题。最终生成统一的 `videos`、`audio_embs` 及 `metadata.json`。
 > **提示词（Prompt）秘籍**：千万别再使用泛泛而谈的 `A person is talking.`！由于底模本身表现欲极强，提示词一定要往端庄、安静、冷感的方向引导，比如使用 `A professional news anchor is broadcasting, sitting completely still, hands kept down.`。正向精准词+训练强大的视觉 LoRA，能彻底根治生成的视频乱挥手的问题。
@@ -70,15 +70,15 @@ python train_lora.py \
     --lora_alpha 64 \
     --lr 1e-4 \
     --max_steps 3000 \
-    --frame_num 41 \
-    --target_h 1088 \
-    --target_w 688 \
+    --frame_num 29 \
+    --target_h 1024 \
+    --target_w 656 \
     --ref_neighbor_frames 25 \
     --cfg_drop_text_prob 0.1 \
     --cfg_drop_audio_prob 0.1 \
     --cfg_drop_both_prob 0.05 \
     --use_8bit_optim \
-    --blocks_to_swap 35 \
+    --blocks_to_swap 38 \
     --gradient_checkpointing \
     --use_amp \
     --output_dir output/my_lora \
