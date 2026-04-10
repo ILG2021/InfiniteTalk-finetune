@@ -991,7 +991,7 @@ def train(args):
             loss.backward()
             grad_norm_val: Optional[torch.Tensor] = None
             if args.max_grad_norm > 0:
-                grad_norm_val = torch.nn.utils.clip_grad_norm_(lora_params, args.max_grad_norm)
+                grad_norm_val = torch.nn.utils.clip_grad_norm_(visual_params + audio_params, args.max_grad_norm)
 
             optimizer.step()
             scheduler.step()
