@@ -1031,6 +1031,7 @@ def train(args):
                     optimizer,
                     scheduler,
                     args,
+                    suffix=str(current_step),
                 )
                 logging.info(f"Saved checkpoint adapter: {adapter_path}")
                 if inference_lora_path:
