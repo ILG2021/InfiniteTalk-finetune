@@ -684,14 +684,18 @@ def train(args):
         model.prepare_block_swap_before_forward()
     
     # ---- Collect trainable parameters (keep in float32 for training stability) ----
-    lora_params = []
+    visual_params = []
+    audio_params = []
     for name, param in model.named_parameters():
         if param.requires_grad:
             # Keep LoRA adapters in float32 exactly like musubi-tuner for max stability
-            lora_params.append(param)
+            if 'audio' in name:
+                audio_params.append(param)
+            else:
+                visual_params.append(param)
             logging.info(f"  Trainable: {name} {param.shape} ({param.data.dtype})")
 
-    total_trainable = sum(p.numel() for p in lora_params)
+    total_trainable = sum(p.numel() for p in visual_params + audio_params)
     total_params = sum(p.numel() for p in model.parameters())
     logging.info(f"Trainable params: {total_trainable:,} / {total_params:,} "
                  f"({100 * total_trainable / total_params:.4f}%)")
@@ -707,16 +711,23 @@ def train(args):
         logging.info("Gradient checkpointing: FULLY ENABLED (Instance + Patch)")
 
     # ---- Optimizer ----
+    audio_lr = args.audio_lr if getattr(args, "audio_lr", None) is not None else args.lr
+    param_groups = [
+        {"params": visual_params, "lr": args.lr},
+        {"params": audio_params, "lr": audio_lr}
+    ]
+    logging.info(f"Optimizer param groups: visual_lr={args.lr}, audio_lr={audio_lr}")
+
     if getattr(args, "use_8bit_optim", False):
         try:
             import bitsandbytes as bnb
-            optimizer = bnb.optim.AdamW8bit(lora_params, lr=args.lr, weight_decay=args.weight_decay)
+            optimizer = bnb.optim.AdamW8bit(param_groups, weight_decay=args.weight_decay)
             logging.info("Using 8-bit AdamW optimizer from bitsandbytes.")
         except ImportError:
             logging.warning("bitsandbytes not installed. Falling back to regular AdamW.")
-            optimizer = torch.optim.AdamW(lora_params, lr=args.lr, weight_decay=args.weight_decay)
+            optimizer = torch.optim.AdamW(param_groups, weight_decay=args.weight_decay)
     else:
-        optimizer = torch.optim.AdamW(lora_params, lr=args.lr, weight_decay=args.weight_decay)
+        optimizer = torch.optim.AdamW(param_groups, weight_decay=args.weight_decay)
 
     # ---- LR Scheduler ----
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -774,7 +785,10 @@ def train(args):
     num_timesteps = 1000
     vae_stride = (4, 8, 8)
     patch_size = (1, 2, 2)
-    shift = 7.0  # for 480P
+    # Dynamically select shift based on training resolution (480P vs 720P range)
+    area = args.target_w * args.target_h
+    shift = 11.0 if area > 600000 else 7.0
+    logging.info(f"Target resolution {args.target_w}x{args.target_h} (Area: {area}), using shift={shift}")
 
     # ---- Training ----
     logging.info(f"Starting LoRA training for {args.max_steps} steps...")
@@ -1079,7 +1093,8 @@ def parse_args():
                         help="Comma-separated target module patterns. Default: audio_cross_attn layers")
 
     # Training config
-    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--lr", type=float, default=1e-4, help="Base learning rate for visual/attention layers.")
+    parser.add_argument("--audio_lr", type=float, default=None, help="Separate learning rate for audio layers. If None, uses --lr.")
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--max_steps", type=int, default=1000)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
