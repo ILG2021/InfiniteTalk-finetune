@@ -37,6 +37,15 @@ from wan.modules.multitalk_model import (
 )
 from wan.utils.offload_utils import ModelOffloader, _clean_memory_on_device
 
+DEFAULT_TARGET_MODULES = [
+    # Identity / Visual appearance pathways
+    'self_attn.q', 'self_attn.k', 'self_attn.v', 'self_attn.o',
+    'cross_attn.q', 'cross_attn.k', 'cross_attn.v', 'cross_attn.k_img', 'cross_attn.v_img', 'cross_attn.o',
+    'ffn.0', 'ffn.2',
+    # Audio-mouth sync pathways
+    'audio_cross_attn.q_linear', 'audio_cross_attn.kv_linear', 'audio_cross_attn.proj',
+    'audio_proj.proj1', 'audio_proj.proj1_vf', 'audio_proj.proj2', 'audio_proj.proj3',
+]
 
 # ============================================================
 # LoRA Module
@@ -91,29 +100,7 @@ def apply_lora_to_model(model: nn.Module, rank: int = 16, alpha: float = 16.0,
             Defaults to audio_cross_attn layers.
     """
     if target_modules is None:
-        target_modules = [
-            # Identity / Visual appearance pathways
-            'self_attn.q',
-            'self_attn.k',
-            'self_attn.v',
-            'self_attn.o',
-            'cross_attn.q',
-            'cross_attn.k',
-            'cross_attn.v',
-            'cross_attn.k_img',
-            'cross_attn.v_img',
-            'cross_attn.o',
-            'ffn.0',
-            'ffn.2',
-            # Audio-mouth sync pathways
-            'audio_cross_attn.q_linear',
-            'audio_cross_attn.kv_linear',
-            'audio_cross_attn.proj',
-            'audio_proj.proj1',
-            'audio_proj.proj1_vf',
-            'audio_proj.proj2',
-            'audio_proj.proj3',
-        ]
+        target_modules = DEFAULT_TARGET_MODULES
 
     lora_modules = {}
     for name, module in model.named_modules():
@@ -187,7 +174,15 @@ def _align_audio_frames_to_latent(audio_b: torch.Tensor, f_req: int) -> torch.Te
 def _serialize_args(args: argparse.Namespace) -> Dict[str, Any]:
     """JSON-friendly hyperparameter dict for checkpoints."""
     out: Dict[str, Any] = {}
-    for k, v in vars(args).items():
+    
+    # Pre-resolve defaults for clarity in checkpoint jsons
+    resolved_args = vars(args).copy()
+    if not resolved_args.get("target_modules"):
+        resolved_args["target_modules"] = ",".join(DEFAULT_TARGET_MODULES)
+    if not resolved_args.get("tensorboard_dir"):
+        resolved_args["tensorboard_dir"] = "output/my_lora/tensorboard"
+
+    for k, v in resolved_args.items():
         if v is None or isinstance(v, (bool, int, float, str)):
             out[k] = v
         elif isinstance(v, (list, tuple)):
