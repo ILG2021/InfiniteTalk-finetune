@@ -3,7 +3,7 @@ import glob
 import argparse
 from safetensors.torch import load_file, save_file
 
-def convert_dir(base_dir, alpha):
+def convert_dir(base_dir):
     checkpoints = glob.glob(os.path.join(base_dir, "checkpoint-*"))
     converted_count = 0
     for ckpt in checkpoints:
@@ -16,8 +16,8 @@ def convert_dir(base_dir, alpha):
         if os.path.exists(adapter_path) and not os.path.exists(inference_path):
             print(f"Processing {ckpt} ...")
             
-            # Auto-detect alpha from trainer_state.json if available
-            current_alpha = alpha
+            # Auto-detect alpha from trainer_state.json
+            current_alpha = 64.0
             if os.path.exists(state_path):
                 try:
                     import json
@@ -27,7 +27,9 @@ def convert_dir(base_dir, alpha):
                         current_alpha = float(state_data["args"]["lora_alpha"])
                         print(f"  -> Auto-detected lora_alpha = {current_alpha} from trainer_state.json")
                 except Exception as e:
-                    print(f"  -> Could not parse trainer_state.json, falling back to alpha = {current_alpha} ({e})")
+                    print(f"  -> Could not parse trainer_state.json, falling back to default alpha = {current_alpha} ({e})")
+            else:
+                print(f"  -> Missing trainer_state.json! Falling back to default alpha = {current_alpha}")
             
             sd = load_file(adapter_path)
             new_sd = {}
@@ -57,10 +59,9 @@ def convert_dir(base_dir, alpha):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--dir", type=str, default="output/my_lora", help="Directory containing checkpoint-* folders")
-    parser.add_argument("--alpha", type=float, default=64.0, help="LoRA alpha used during training")
     args = parser.parse_args()
     
     if not os.path.exists(args.dir):
         print(f"Error: Directory {args.dir} does not exist.")
     else:
-        convert_dir(args.dir, args.alpha)
+        convert_dir(args.dir)
