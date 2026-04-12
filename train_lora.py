@@ -319,7 +319,7 @@ def load_training_checkpoint(
 ) -> Tuple[int, int, Dict[str, Any]]:
     """Loads adapter weights + optimizer/scheduler/scaler/RNG. Supports new checkpoint dirs and legacy .pt."""
     if _is_legacy_training_pt(path):
-        ckpt = torch.load(path, map_location='cpu')
+        ckpt = torch.load(path, map_location='cpu', weights_only=False)
         if ckpt.get('format_version') != 1:
             logging.warning(f"Checkpoint format_version={ckpt.get('format_version')!r}; expected 1")
 
@@ -401,9 +401,9 @@ def load_training_checkpoint(
         )
 
     # 2) Training states
-    optimizer.load_state_dict(torch.load(os.path.join(ckpt_dir, "optimizer.pt"), map_location="cpu"))
-    scheduler.load_state_dict(torch.load(os.path.join(ckpt_dir, "scheduler.pt"), map_location="cpu"))
-    _set_rng_state(torch.load(os.path.join(ckpt_dir, "rng_state.pth"), map_location="cpu"))
+    optimizer.load_state_dict(torch.load(os.path.join(ckpt_dir, "optimizer.pt"), map_location="cpu", weights_only=False))
+    scheduler.load_state_dict(torch.load(os.path.join(ckpt_dir, "scheduler.pt"), map_location="cpu", weights_only=False))
+    _set_rng_state(torch.load(os.path.join(ckpt_dir, "rng_state.pth"), map_location="cpu", weights_only=False))
 
     step = int(trainer_state.get("step", 0))
     epoch = int(trainer_state.get("epoch", 0))
@@ -481,7 +481,7 @@ class InfiniteTalkDataset(Dataset):
         prompt = sample.get('prompt', 'A news anchor is broadcasting.')
 
         # Load pre-computed audio embedding: [total_frames, 12, 768]
-        full_audio_emb = torch.load(audio_emb_path, map_location='cpu')
+        full_audio_emb = torch.load(audio_emb_path, map_location='cpu', weights_only=True)
         total_audio_frames = full_audio_emb.shape[0]
 
         # We need self.frame_num frames for the entire training segment.
