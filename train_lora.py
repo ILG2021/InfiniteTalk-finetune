@@ -758,6 +758,25 @@ def train(args):
                     logging.warning(
                         f"Arg {k!r} differs from checkpoint: current={getattr(args, k)!r} saved={saved_args.get(k)!r}"
                     )
+        # [NEW] Detect if user explicitly requested to override the resumed learning rate
+        _audio_lr_cli = getattr(args, "audio_lr", args.lr)
+        
+        if getattr(args, "override_lr", False):
+            if len(optimizer.param_groups) > 0:
+                optimizer.param_groups[0]['lr'] = args.lr
+                optimizer.param_groups[0]['initial_lr'] = args.lr
+            if len(optimizer.param_groups) > 1:
+                optimizer.param_groups[1]['lr'] = _audio_lr_cli
+                optimizer.param_groups[1]['initial_lr'] = _audio_lr_cli
+            
+            # Since we jump the LR back up, we generate a fresh decay curve for the REMAINING steps
+            remaining_steps = max(1, args.max_steps - current_step)
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=remaining_steps, eta_min=args.lr * 0.1
+            )
+            logging.info(f"override_lr=True: Overridden checkpoint LR with new CLI args: lr={args.lr}, audio_lr={_audio_lr_cli}")
+        else:
+            logging.info("Resuming with checkpoint's decayed learning rate.")
 
     # ---- Dataset ----
     dataset = InfiniteTalkDataset(
@@ -1145,6 +1164,8 @@ def parse_args():
     )
     parser.add_argument("--resume_strict", action=argparse.BooleanOptionalAction, default=True,
                         help="Strict checkpoint key match (trainable param names must match).")
+    parser.add_argument("--override_lr", action=argparse.BooleanOptionalAction, default=False,
+                        help="Force override the resumed optimizer's learning rate with the CLI values.")
 
     # Output
     parser.add_argument("--output_dir", type=str, default="output/lora")

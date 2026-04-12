@@ -68,8 +68,8 @@ python train_lora.py \
     --quant fp8 \
     --lora_rank 64 \
     --lora_alpha 64 \
-    --lr 2e-5 \
-    --audio_lr 5e-5 \
+    --lr 5e-5 \
+    --audio_lr 1e-4 \
     --max_steps 3000 \
     --frame_num 33 \
     --target_h 1024 \
