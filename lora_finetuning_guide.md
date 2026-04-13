@@ -83,7 +83,7 @@ python train_lora.py \
     --gradient_checkpointing \
     --use_amp \
     --output_dir output/my_lora \
-    --save_every 300 \
+    --save_every 100 \
     --log_every 10 \
     --debug_assert_shapes
 ```
