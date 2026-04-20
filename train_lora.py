@@ -177,8 +177,6 @@ def _serialize_args(args: argparse.Namespace) -> Dict[str, Any]:
     
     # Pre-resolve defaults for clarity in checkpoint jsons
     resolved_args = vars(args).copy()
-    if not resolved_args.get("target_modules"):
-        resolved_args["target_modules"] = ",".join(DEFAULT_TARGET_MODULES)
     if not resolved_args.get("tensorboard_dir"):
         resolved_args["tensorboard_dir"] = "output/my_lora/tensorboard"
 
@@ -665,7 +663,12 @@ def train(args):
         param.requires_grad = False
 
     # ---- Apply LoRA to Linear layers (norms remain frozen, following musubi-tuner convention) ----
-    target_modules = args.target_modules.split(',') if args.target_modules else None
+    target_modules = list(DEFAULT_TARGET_MODULES)
+    
+    if not getattr(args, "train_audio", True):
+        target_modules = [m for m in target_modules if 'audio' not in m]
+        logging.info(f"--no-train_audio is set. Filtered target_modules: {target_modules}")
+
     model = apply_lora_to_model(model, rank=args.lora_rank, alpha=args.lora_alpha,
                                 target_modules=target_modules)
 
@@ -1104,12 +1107,11 @@ def parse_args():
                         help="LoRA rank")
     parser.add_argument("--lora_alpha", type=float, default=16.0,
                         help="LoRA alpha")
-    parser.add_argument("--target_modules", type=str, default=None,
-                        help="Comma-separated target module patterns. Default: audio_cross_attn layers")
 
     # Training config
     parser.add_argument("--lr", type=float, default=1e-4, help="Base learning rate for visual/attention layers.")
     parser.add_argument("--audio_lr", type=float, default=None, help="Separate learning rate for audio layers. If None, uses --lr.")
+    parser.add_argument("--train_audio", action=argparse.BooleanOptionalAction, default=True, help="Whether to fine-tune audio layers. Use --no-train_audio to skip audio layers.")
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--max_steps", type=int, default=1000)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)

@@ -68,9 +68,10 @@ python train_lora.py \
     --quant fp8 \
     --lora_rank 64 \
     --lora_alpha 64 \
-    --lr 5e-5 \
+    --lr 1e-4 \
     --audio_lr 1e-4 \
-    --max_steps 3000 \
+    --no-train_audio \   # 口型对不上的时候开启
+    --max_steps 5000 \
     --frame_num 33 \
     --target_h 1024 \
     --target_w 656 \
