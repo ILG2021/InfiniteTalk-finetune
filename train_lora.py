@@ -308,6 +308,56 @@ def save_training_checkpoint(
     return adapter_path, inference_lora_path
 
 
+def _trim_optimizer_state_dict(
+        saved_sd: Dict[str, Any],
+        optimizer: torch.optim.Optimizer,
+) -> Dict[str, Any]:
+    """
+    Trim a saved optimizer state_dict to fit the current optimizer's param groups.
+    Handles the case where the current run has fewer trainable params (e.g. audio
+    layers removed via --no-train_audio). Params that existed in the checkpoint but
+    are no longer present are dropped; their momentum/state tensors are discarded.
+    """
+    saved_groups = saved_sd["param_groups"]
+    curr_groups  = optimizer.param_groups
+
+    new_state  = {}
+    new_groups = []
+    new_id = 0
+
+    for g_idx, curr_g in enumerate(curr_groups):
+        n_params = len(curr_g["params"])      # How many params current group expects
+
+        if g_idx < len(saved_groups):
+            saved_g  = saved_groups[g_idx]
+            old_ids  = saved_g["params"]      # Param IDs as stored in checkpoint
+
+            # Copy state for the first n_params entries (rest are the removed layers)
+            for i, old_id in enumerate(old_ids[:n_params]):
+                if old_id in saved_sd["state"]:
+                    new_state[new_id + i] = saved_sd["state"][old_id]
+
+            # Build trimmed group (same hyper-params, fresh param ID list)
+            trimmed = {k: v for k, v in saved_g.items() if k != "params"}
+            trimmed["params"] = list(range(new_id, new_id + n_params))
+
+            dropped = max(0, len(old_ids) - n_params)
+            if dropped:
+                logging.warning(
+                    f"Optimizer group {g_idx}: dropped {dropped} params "
+                    f"(not present in current model, e.g. audio layers)."
+                )
+        else:
+            # Checkpoint has fewer groups than current optimizer — use current hyper-params
+            trimmed = {k: v for k, v in curr_g.items() if k != "params"}
+            trimmed["params"] = list(range(new_id, new_id + n_params))
+
+        new_groups.append(trimmed)
+        new_id += n_params
+
+    return {"state": new_state, "param_groups": new_groups}
+
+
 def load_training_checkpoint(
         path: str,
         model: nn.Module,
@@ -399,7 +449,9 @@ def load_training_checkpoint(
         )
 
     # 2) Training states
-    optimizer.load_state_dict(torch.load(os.path.join(ckpt_dir, "optimizer.pt"), map_location="cpu", weights_only=False))
+    saved_opt_sd = torch.load(os.path.join(ckpt_dir, "optimizer.pt"), map_location="cpu", weights_only=False)
+    opt_sd = _trim_optimizer_state_dict(saved_opt_sd, optimizer)
+    optimizer.load_state_dict(opt_sd)
     scheduler.load_state_dict(torch.load(os.path.join(ckpt_dir, "scheduler.pt"), map_location="cpu", weights_only=False))
     _set_rng_state(torch.load(os.path.join(ckpt_dir, "rng_state.pth"), map_location="cpu", weights_only=False))
 
