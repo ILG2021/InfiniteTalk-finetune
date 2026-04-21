@@ -750,7 +750,7 @@ def train(args):
             model,
             optimizer,
             scheduler,
-            strict=args.resume_strict,
+            strict=False,
         )
         os.makedirs(args.output_dir, exist_ok=True)
         with open(os.path.join(args.output_dir, "resume_meta.json"), "w", encoding="utf-8") as f:
@@ -1164,8 +1164,7 @@ def parse_args():
         default=None,
         help="Resume from a checkpoint directory (checkpoint-<step> with adapter_model.safetensors, optimizer.pt, etc) or legacy training_*.pt.",
     )
-    parser.add_argument("--resume_strict", action=argparse.BooleanOptionalAction, default=True,
-                        help="Strict checkpoint key match (trainable param names must match).")
+
     parser.add_argument("--override_lr", action=argparse.BooleanOptionalAction, default=False,
                         help="Force override the resumed optimizer's learning rate with the CLI values.")
 
