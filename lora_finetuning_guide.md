@@ -72,6 +72,7 @@ python train_lora.py \
     --audio_lr 1e-4 \
     --no-train_audio \
     --max_steps 5000 \
+    --bias_switch_step 2500 \
     --frame_num 33 \
     --target_h 1024 \
     --target_w 656 \

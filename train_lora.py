@@ -859,6 +859,40 @@ def train(args):
     shift = 11.0 if area > 600000 else 7.0
     logging.info(f"Target resolution {args.target_w}x{args.target_h} (Area: {area}), using shift={shift}")
 
+    # ---- Timestep bias sampler (AI Toolkit style) ----
+    # high_noise : current behavior, shift=11, skews >87% of steps toward t>917 (learns structure/motion)
+    # balanced   : logit-normal N(0,1)|sigmoid, centers sampling at t≈500 (learns structure + fine detail)
+    # low_noise  : logit-normal N(-2,1)|sigmoid, concentrates at t<300 (learns fine detail / identity)
+    def sample_training_timestep(bias: str) -> torch.Tensor:
+        """Returns a scalar fractional timestep t_frac in [0,1] according to the chosen bias strategy."""
+        if bias == 'high_noise':
+            # Original flow-matching shift formula — heavily skewed toward high noise
+            t = torch.rand(1, device=device, dtype=torch.float32)
+            t = shift * t / (1 + (shift - 1) * t)
+        elif bias == 'balanced':
+            # Logit-normal distribution: sigmoid(N(0, σ=1.6)) → concentrates around t=0.5
+            # Covers the full denoising spectrum rather than camping at t>0.9
+            u = torch.randn(1, device=device, dtype=torch.float32) * 1.6
+            t = torch.sigmoid(u)
+        elif bias == 'low_noise':
+            # Logit-normal shifted negative: sigmoid(N(-2.5, σ=1.2)) → concentrates at t<0.3
+            # Forces the model to learn fine facial details and skin texture
+            u = torch.randn(1, device=device, dtype=torch.float32) * 1.2 - 2.5
+            t = torch.sigmoid(u)
+        else:
+            raise ValueError(f"Unknown timestep_bias: {bias!r}. Choose: high_noise | balanced | low_noise")
+        return t  # shape [1], dtype float32, range [0,1]
+
+    initial_bias = getattr(args, 'timestep_bias', 'high_noise')
+    bias_switch_step = getattr(args, 'bias_switch_step', 0)
+    if bias_switch_step > 0:
+        logging.info(
+            f"Timestep bias schedule: '{initial_bias}' for steps 1-{bias_switch_step}, "
+            f"then 'balanced' from step {bias_switch_step+1} onwards."
+        )
+    else:
+        logging.info(f"Timestep bias: '{initial_bias}' (fixed, no auto-switch)")
+
     # ---- Training ----
     logging.info(f"Starting LoRA training for {args.max_steps} steps...")
     logging.info(f"Sampling first-clip probability: {args.first_clip_prob:.2f}")
@@ -994,9 +1028,12 @@ def train(args):
 
             # ---- Flow matching interpolation ----
             x_0 = torch.randn_like(x_1)
-            t_frac = torch.rand(1, device=device, dtype=x_1.dtype)
-            # Shift T
-            t_frac = shift * t_frac / (1 + (shift - 1) * t_frac)
+            # Determine active bias (auto-switch from high_noise → balanced after bias_switch_step)
+            if bias_switch_step > 0 and current_step >= bias_switch_step:
+                active_bias = 'balanced'
+            else:
+                active_bias = initial_bias
+            t_frac = sample_training_timestep(active_bias).to(dtype=x_1.dtype)
             t_shifted = t_frac * num_timesteps
 
             x_t = cast(torch.Tensor, t_frac.view(1, 1, 1, 1) * x_0 + (1 - t_frac).view(1, 1, 1, 1) * x_1)
@@ -1081,6 +1118,8 @@ def train(args):
                 writer.add_scalar("train/is_continuation", 1.0 if is_continuation else 0.0, current_step)
                 writer.add_scalar("train/cfg_drop_text", 1.0 if drop_text else 0.0, current_step)
                 writer.add_scalar("train/cfg_drop_audio", 1.0 if drop_audio else 0.0, current_step)
+                writer.add_scalar("train/timestep_frac", float(t_frac.item()), current_step)
+                writer.add_scalar("train/timestep_bias_high_noise", 1.0 if active_bias == 'high_noise' else 0.0, current_step)
                 if grad_norm_val is not None:
                     writer.add_scalar("train/grad_norm", float(grad_norm_val), current_step)
                 writer.flush()
@@ -1219,6 +1258,32 @@ def parse_args():
 
     parser.add_argument("--override_lr", action=argparse.BooleanOptionalAction, default=False,
                         help="Force override the resumed optimizer's learning rate with the CLI values.")
+
+    # Timestep bias (AI Toolkit style two-stage training)
+    parser.add_argument(
+        "--timestep_bias",
+        type=str,
+        default="high_noise",
+        choices=["high_noise", "balanced", "low_noise"],
+        help=(
+            "Timestep sampling bias strategy (AI Toolkit style).\n"
+            "  high_noise : shift=11 formula — focuses on t>875 (structure/composition). DEFAULT. Backward-compatible.\n"
+            "  balanced   : logit-normal sigmoid(N(0,1.6)) — covers full range, medium-noise focus (face + structure).\n"
+            "  low_noise  : logit-normal sigmoid(N(-2.5,1.2)) — focuses on t<300 (fine detail, skin, identity).\n"
+            "Stage-2 recommendation: use --timestep_bias balanced after completing high_noise stage."
+        ),
+    )
+    parser.add_argument(
+        "--bias_switch_step",
+        type=int,
+        default=0,
+        help=(
+            "Auto-switch from --timestep_bias to 'balanced' after this many steps. "
+            "0 = disabled (keep fixed bias for entire run). "
+            "Example: resume with --timestep_bias high_noise --bias_switch_step 0 for pure stage-2 "
+            "OR just pass --timestep_bias balanced to skip straight to balanced."
+        ),
+    )
 
     # Output
     parser.add_argument("--output_dir", type=str, default="output/lora")
