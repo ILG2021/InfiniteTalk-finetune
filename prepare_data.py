@@ -140,15 +140,11 @@ def get_crop_params(video_path, target_w, target_h):
         
         return crop_w, crop_h, crop_x, crop_y
     else:
-        print("  Warning: No person detected by YOLO. Using center-crop fallback.")
-        crop_h = h
-        crop_w = int(h * target_ratio)
-        if crop_w > w:
-            crop_w = w
-            crop_h = int(w / target_ratio)
-        crop_x = int((w - crop_w) / 2)
-        crop_y = int((h - crop_h) / 2)
-        return crop_w, crop_h, crop_x, crop_y
+        raise RuntimeError(
+            f"YOLO found no person in any of the anchor frames {anchor_frames} of:\n  {video_path}\n"
+            f"Please check that the video contains a clearly visible person, "
+            f"or delete this video from the input directory."
+        )
 
 
 def extract_audio_from_video(video_path, target_sr=16000):
@@ -382,6 +378,8 @@ def main():
                         help="Target height for cropped video")
     parser.add_argument("--target_w", type=int, default=480,
                         help="Target width for cropped video")
+    parser.add_argument("--force_recrop", action="store_true",
+                        help="Force re-cropping even if processed video already exists.")
     args = parser.parse_args()
 
     # Create output dirs
@@ -418,16 +416,16 @@ def main():
         dst_video = os.path.join(args.output_dir, 'videos', out_video_name)
 
         try:
-            # 1. Smart Crop Base on Face Detection & Force 25 FPS
-            if not os.path.exists(dst_video):
+            # 1. Smart Crop Based on Person Detection & Force 25 FPS
+            if not os.path.exists(dst_video) or args.force_recrop:
+                if args.force_recrop and os.path.exists(dst_video):
+                    print(f"\n  [force_recrop] Removing existing video: {dst_video}")
+                    os.remove(dst_video)
                 print(f"\n  Analyzing {video_file} for face-center crop...")
-                crop_params = get_crop_params(video_path, args.target_w, args.target_h)
-                
-                if crop_params:
-                    cw, ch, cx, cy = crop_params
-                    vf_filter = f"crop={cw}:{ch}:{cx}:{cy},scale={args.target_w}:{args.target_h}"
-                else:
-                    vf_filter = f"scale={args.target_w}:{args.target_h}:force_original_aspect_ratio=increase,crop={args.target_w}:{args.target_h}"
+                # get_crop_params raises RuntimeError if no person detected — no fallback
+                cw, ch, cx, cy = get_crop_params(video_path, args.target_w, args.target_h)
+                vf_filter = f"crop={cw}:{ch}:{cx}:{cy},scale={args.target_w}:{args.target_h}"
+                print(f"  Crop box: x={cx} y={cy} w={cw} h={ch} → scale to {args.target_w}x{args.target_h}")
                 
                 print(f"  Cropping to {args.target_w}x{args.target_h} & Forcing 25 FPS...")
                 import subprocess
