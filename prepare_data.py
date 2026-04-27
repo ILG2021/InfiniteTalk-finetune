@@ -28,12 +28,9 @@ from pathlib import Path
 from tqdm import tqdm
 
 def get_crop_params(video_path, target_w, target_h):
-    """Detect face and calculate crop dimensions to keep face centered using robust multi-frame sampling."""
+    """Detect person/face and calculate crop dimensions using YOLO or MediaPipe."""
     import cv2
     import os
-    import mediapipe as mp
-    from mediapipe.tasks import python
-    from mediapipe.tasks.python import vision
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -43,74 +40,115 @@ def get_crop_params(video_path, target_w, target_h):
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-
-    # Heuristic: check multiple frames (10%, 33%, 50%) to find a face
-    sample_points = [total_frames // 10, total_frames // 3, total_frames // 2]
-    cx, cy = w // 2, h // 2  # Default center
-    face_found = False
-
-    # Use 'full_range' model (~2.3MB) which is better for studio/mid-range shots than 'short_range'
-    model_path = os.path.join('weights', 'face_detector_full.tflite')
-    if not os.path.exists(model_path):
-        os.makedirs('weights', exist_ok=True)
-        try:
-            import urllib.request
-            print(f"Downloading robust full-range face detector to {model_path}...")
-            url = "https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_full_range/float16/1/blaze_face_full_range.tflite"
-            urllib.request.urlretrieve(url, model_path)
-        except Exception as e:
-            print(f"Auto-download failed: {e}. Falling back to default center if model missing.")
-
-    try:
-        if os.path.exists(model_path):
-            base_options = python.BaseOptions(model_asset_path=model_path)
-            options = vision.FaceDetectorOptions(base_options=base_options)
-
-            with vision.FaceDetector.create_from_options(options) as detector:
-                for sp in sample_points:
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, sp)
-                    ret, frame = cap.read()
-                    if not ret: continue
-
-                    # Convert to MediaPipe Image
-                    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB,
-                                        data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-                    detection_result = detector.detect(mp_image)
-
-                    if detection_result.detections:
-                        bbox = detection_result.detections[0].bounding_box
-                        cx = int(bbox.origin_x + bbox.width / 2)
-                        cy = int(bbox.origin_y + bbox.height / 2)
-                        face_found = True
-                        print(f"  Face detected at frame {sp}: position ({cx}, {cy})")
-                        break # Found a face, use these coordinates
-    except Exception as e:
-        print(f"  MediaPipe Detection Failed: {e}. Using center-crop fallback.")
-
-    cap.release()
-    if not face_found:
-        print("  Warning: No face detected in sample frames. Using center-crop fallback.")
-
-    # Calculate crop dimensions
     target_ratio = target_w / target_h
-    src_ratio = w / h
+
+    # 寻找一个包含人物的“锚点帧”（避免第一帧是全黑或渐显）
+    # 一旦找到，就会计算出全局唯一的裁切框，应用到整个视频
+    anchor_frames = [0, total_frames // 10, total_frames // 2]
     
-    if src_ratio > target_ratio:
-        # Source is wider, crop the width
-        crop_h = h
-        crop_w = int(h * target_ratio)
-        crop_y = 0
+    # ==========================================
+    # YOLO Person Detection (Forced Dependency)
+    # ==========================================
+    try:
+        from ultralytics import YOLO
+    except ImportError:
+        print("  [Info] ultralytics not found. Force installing ultralytics...")
+        import subprocess
+        import sys
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "ultralytics"])
+        from ultralytics import YOLO
+        
+    # Load lightweight YOLOv8n model
+    model = YOLO('yolov8n.pt')
+    
+    person_xmin, person_ymin, person_xmax, person_ymax = 0, 0, w, h
+    person_found = False
+    
+    for check_idx in anchor_frames:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, check_idx)
+        ret, frame = cap.read()
+        if not ret:
+            continue
+            
+        # Predict person class (class 0)
+        results = model(frame, classes=[0], verbose=False)
+        
+        if results and len(results[0].boxes) > 0:
+            largest_area = 0
+            for box in results[0].boxes:
+                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                area = (x2 - x1) * (y2 - y1)
+                if area > largest_area:
+                    largest_area = area
+                    person_xmin, person_ymin, person_xmax, person_ymax = x1, y1, x2, y2
+            
+            if largest_area > 0:
+                print(f"  YOLO anchor frame found at idx {check_idx}: size {int(person_xmax-person_xmin)}x{int(person_ymax-person_ymin)}")
+                person_found = True
+                break  # 找到一个有效帧就立刻退出，保证只生成一个静态裁切框
+                
+    cap.release()
+    
+    if person_found:
+        person_w_box = person_xmax - person_xmin
+        person_h_box = person_ymax - person_ymin
+        
+        # Add padding (10% of width/height) for "留白"
+        padding_x = person_w_box * 0.10
+        padding_y = person_h_box * 0.10
+        
+        person_top = max(0, person_ymin - padding_y)
+        person_bottom = min(h, person_ymax + padding_y)
+        person_left = max(0, person_xmin - padding_x)
+        person_right = min(w, person_xmax + padding_x)
+        
+        min_crop_w = person_right - person_left
+        min_crop_h = person_bottom - person_top
+        cx = (person_left + person_right) / 2
+        
+        # Calculate crop dimensions satisfying target_ratio
+        # Determine the binding dimension: whichever side needs more expansion drives the crop size
+        crop_by_h = min_crop_h * target_ratio  # width needed if height is the limit
+        crop_by_w = min_crop_w / target_ratio  # height needed if width is the limit
+        
+        if crop_by_h >= min_crop_w:
+            # Height is the binding dimension: set height, derive width
+            crop_h = min_crop_h
+            crop_w = crop_by_h
+        else:
+            # Width is the binding dimension: set width, derive height
+            crop_w = min_crop_w
+            crop_h = crop_by_w
+        
+        # Clamp to video boundaries, maintaining ratio
+        if crop_h > h:
+            crop_h = h
+            crop_w = crop_h * target_ratio
+        if crop_w > w:
+            crop_w = w
+            crop_h = crop_w / target_ratio
+            
+        crop_h = int(crop_h)
+        crop_w = int(crop_w)
+        
         crop_x = int(cx - crop_w / 2)
+        extra_h = max(0, crop_h - min_crop_h)
+        crop_y = int(person_top - extra_h * 0.5)
+        
         crop_x = max(0, min(crop_x, w - crop_w))
-    else:
-        # Source is taller, crop the height
-        crop_w = w
-        crop_h = int(w / target_ratio)
-        crop_x = 0
-        crop_y = int(cy - crop_h / 2)
         crop_y = max(0, min(crop_y, h - crop_h))
         
-    return crop_w, crop_h, crop_x, crop_y
+        return crop_w, crop_h, crop_x, crop_y
+    else:
+        print("  Warning: No person detected by YOLO. Using center-crop fallback.")
+        crop_h = h
+        crop_w = int(h * target_ratio)
+        if crop_w > w:
+            crop_w = w
+            crop_h = int(w / target_ratio)
+        crop_x = int((w - crop_w) / 2)
+        crop_y = int((h - crop_h) / 2)
+        return crop_w, crop_h, crop_x, crop_y
 
 
 def extract_audio_from_video(video_path, target_sr=16000):
@@ -155,6 +193,150 @@ def extract_wav2vec2_embeddings(audio_path_or_waveform, feature_extractor, wav2v
     hidden_states = hidden_states.squeeze(0).permute(1, 0, 2)  # num_video_frames, 12, 768
 
     return hidden_states.cpu()
+
+
+def select_best_ref_frame(video_path, target_w, target_h, num_samples=20):
+    """Select the best reference frame from a video.
+    
+    Scoring criteria (higher is better):
+    - Face size: larger face = more frontal / closer
+    - Mouth closed: neutral expression preferred for reference
+    - Sharpness: Laplacian variance (less blur = better)
+    
+    Returns: best frame as numpy array (BGR, target_w x target_h), or None
+    """
+    import cv2
+    import mediapipe as mp
+    from mediapipe.tasks import python
+    from mediapipe.tasks.python import vision
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return None
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if total_frames < 1:
+        cap.release()
+        return None
+
+    # Sample frames evenly across the video
+    sample_indices = np.linspace(0, total_frames - 1, min(num_samples, total_frames), dtype=int)
+
+    # Load face detector
+    model_path = os.path.join('weights', 'face_detector_full.tflite')
+    
+    # Load face landmarker for mouth detection
+    face_landmarker_path = os.path.join('weights', 'face_landmarker.task')
+    need_download_landmarker = False
+    if not os.path.exists(face_landmarker_path):
+        os.makedirs('weights', exist_ok=True)
+        try:
+            import urllib.request
+            print(f"  Downloading face landmarker model for mouth detection...")
+            url = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task"
+            urllib.request.urlretrieve(url, face_landmarker_path)
+        except Exception as e:
+            print(f"  Face landmarker download failed: {e}. Will use face size only for scoring.")
+            need_download_landmarker = True
+
+    best_score = -1
+    best_frame = None
+
+    try:
+        # Setup face detector
+        if os.path.exists(model_path):
+            base_options = python.BaseOptions(model_asset_path=model_path)
+            options = vision.FaceDetectorOptions(base_options=base_options)
+            
+            # Setup face landmarker for mouth detection
+            landmarker = None
+            if os.path.exists(face_landmarker_path):
+                try:
+                    landmarker_base = python.BaseOptions(model_asset_path=face_landmarker_path)
+                    landmarker_options = vision.FaceLandmarkerOptions(
+                        base_options=landmarker_base,
+                        output_face_blendshapes=True,
+                        num_faces=1,
+                    )
+                    landmarker = vision.FaceLandmarker.create_from_options(landmarker_options)
+                except Exception:
+                    landmarker = None
+
+            with vision.FaceDetector.create_from_options(options) as detector:
+                for idx in sample_indices:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
+                    ret, frame = cap.read()
+                    if not ret:
+                        continue
+
+                    # Resize to target size for consistent scoring
+                    frame_resized = cv2.resize(frame, (target_w, target_h))
+
+                    # Convert to MediaPipe Image
+                    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB,
+                                        data=cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB))
+                    detection_result = detector.detect(mp_image)
+
+                    if not detection_result.detections:
+                        continue
+
+                    # Score 1: Face size (larger = better, more frontal)
+                    bbox = detection_result.detections[0].bounding_box
+                    face_area = bbox.width * bbox.height
+                    frame_area = target_w * target_h
+                    face_ratio = face_area / frame_area  # 0~1
+                    face_score = min(face_ratio * 5, 1.0)  # Scale: 20% face area = max score
+
+                    # Score 2: Mouth closed (check blendshapes if landmarker available)
+                    mouth_score = 0.5  # Default neutral
+                    if landmarker is not None:
+                        try:
+                            landmark_result = landmarker.detect(mp_image)
+                            if landmark_result.face_blendshapes:
+                                blends = {bs.category_name: bs.score for bs in landmark_result.face_blendshapes[0]}
+                                jaw_open = blends.get('jawOpen', 0)
+                                mouth_open = blends.get('mouthOpen', 0)
+                                # Lower jaw/mouth open = better (closed mouth preferred)
+                                mouth_score = 1.0 - min((jaw_open + mouth_open) * 3, 1.0)
+                        except Exception:
+                            pass
+
+                    # Score 3: Sharpness (Laplacian variance)
+                    gray = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2GRAY)
+                    sharpness = cv2.Laplacian(gray, cv2.CV_64F).var()
+                    # Normalize: typical sharpness 50-500
+                    sharpness_score = min(sharpness / 300.0, 1.0)
+
+                    # Combined score
+                    total_score = face_score * 0.4 + mouth_score * 0.35 + sharpness_score * 0.25
+
+                    if total_score > best_score:
+                        best_score = total_score
+                        best_frame = frame_resized
+
+            if landmarker is not None:
+                landmarker.close()
+
+        else:
+            # No face detector: fallback - pick sharpest frame from center portion
+            center_indices = sample_indices[len(sample_indices)//4 : 3*len(sample_indices)//4]
+            for idx in center_indices:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
+                ret, frame = cap.read()
+                if not ret:
+                    continue
+                frame_resized = cv2.resize(frame, (target_w, target_h))
+                gray = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2GRAY)
+                sharpness = cv2.Laplacian(gray, cv2.CV_64F).var()
+                if sharpness > best_score:
+                    best_score = sharpness
+                    best_frame = frame_resized
+
+    except Exception as e:
+        print(f"  Reference frame selection failed: {e}")
+
+    cap.release()
+    return best_frame
 
 
 def get_video_info(video_path):
@@ -205,6 +387,7 @@ def main():
     # Create output dirs
     os.makedirs(os.path.join(args.output_dir, 'videos'), exist_ok=True)
     os.makedirs(os.path.join(args.output_dir, 'audio_embs'), exist_ok=True)
+    os.makedirs(os.path.join(args.output_dir, 'ref_images'), exist_ok=True)
 
     # Load wav2vec2 (inference style)
     print(f"Loading wav2vec2 model: {args.wav2vec_model}")
@@ -256,36 +439,64 @@ def main():
                     '-c:a', 'aac', '-b:a', '192k',
                     dst_video
                 ]
-                subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                result = subprocess.run(cmd, capture_output=True, text=True)
+                if result.returncode != 0:
+                    raise RuntimeError(
+                        f"FFmpeg failed (code {result.returncode}):\n{result.stderr[-2000:]}"
+                    )
 
             # 2. Get info from the *processed* standardized video
             info = get_video_info(dst_video)
             print(f"\n  Processed {out_video_name}: {info['duration']:.1f}s, {info['fps']:.0f}fps, "
                   f"{info['width']}x{info['height']}")
 
-            # 3. Extract audio from the processed video
-            waveform, sr = extract_audio_from_video(dst_video)
-            print(f"  Audio: {len(waveform)/sr:.1f}s, {sr}Hz")
-
-            # 4. Extract wav2vec2 embeddings
-            audio_emb = extract_wav2vec2_embeddings(
-                waveform, processor, wav2vec_model,
-                video_fps=25, sr=sr, device=args.device
-            )
-            print(f"  Embedding shape: {audio_emb.shape}")
-
-            # Save
+            # 3 & 4. Extract audio + wav2vec2 embeddings (skip if already exists)
             emb_file = f"{stem}.pt"
-            torch.save(audio_emb, os.path.join(args.output_dir, 'audio_embs', emb_file))
+            emb_path = os.path.join(args.output_dir, 'audio_embs', emb_file)
+            if not os.path.exists(emb_path):
+                # 3. Extract audio from the processed video
+                waveform, sr = extract_audio_from_video(dst_video)
+                print(f"  Audio: {len(waveform)/sr:.1f}s, {sr}Hz")
 
-            samples.append({
+                # 4. Extract wav2vec2 embeddings
+                audio_emb = extract_wav2vec2_embeddings(
+                    waveform, processor, wav2vec_model,
+                    video_fps=25, sr=sr, device=args.device
+                )
+                print(f"  Embedding shape: {audio_emb.shape}")
+                torch.save(audio_emb, emb_path)
+                print(f"  Saved embedding: {emb_file}")
+            else:
+                # Load existing embedding to get num_frames
+                audio_emb = torch.load(emb_path, map_location='cpu', weights_only=True)
+                print(f"  Embedding already exists, loaded: {emb_file} shape={audio_emb.shape}")
+
+            # 5. Auto-select best reference frame (front-facing, mouth closed, sharp)
+            ref_image_name = f"{stem}_ref.jpg"
+            ref_image_path = os.path.join(args.output_dir, 'ref_images', ref_image_name)
+            if not os.path.exists(ref_image_path):
+                best_frame = select_best_ref_frame(dst_video, args.target_w, args.target_h)
+                if best_frame is not None:
+                    import cv2 as cv2_ref
+                    cv2_ref.imwrite(ref_image_path, best_frame)
+                    print(f"  Saved reference frame: {ref_image_name}")
+                else:
+                    ref_image_name = None
+                    print(f"  Warning: Could not select reference frame for {video_file}")
+            else:
+                print(f"  Reference frame already exists: {ref_image_name}")
+
+            sample_dict = {
                 'video': out_video_name,
                 'audio_emb': emb_file,
                 'prompt': args.prompt,
                 'duration': info['duration'],
                 'fps': info['fps'],
                 'num_frames': audio_emb.shape[0],
-            })
+            }
+            if ref_image_name:
+                sample_dict['ref_image'] = ref_image_name
+            samples.append(sample_dict)
 
         except Exception as e:
             print(f"  Error processing {video_file}: {e}")

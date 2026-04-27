@@ -555,29 +555,39 @@ class InfiniteTalkDataset(Dataset):
             mode='bilinear', align_corners=False
         )  # T_full, C, H, W (needed_frames, 3, H, W)
 
-        # Reference frame for identity: sample from a temporally adjacent region (paper M3).
-        # Prefer a nearby-but-non-overlapping region to avoid overly strong copy behavior.
-        seg_start = start_frame
-        seg_end = start_frame + needed_frames - 1
-        nb = max(0, int(self.ref_neighbor_frames))
-        left_lo = max(0, seg_start - nb)
-        left_hi = max(0, seg_start - 1)
-        right_lo = min(total_video_frames - 1, seg_end + 1)
-        right_hi = min(total_video_frames - 1, seg_end + nb)
-        candidates: List[int] = []
-        if left_lo <= left_hi:
-            candidates.append(random.randint(left_lo, left_hi))
-        if right_lo <= right_hi:
-            candidates.append(random.randint(right_lo, right_hi))
-        if candidates:
-            ref_offset = random.choice(candidates)
+        # Reference frame for identity
+        ref_image_name = sample.get('ref_image', None)
+        if ref_image_name:
+            # Use fixed reference image from metadata (grouped by expression)
+            from PIL import Image as PILImage
+            ref_img_path = os.path.join(self.data_dir, 'ref_images', ref_image_name)
+            ref_pil = PILImage.open(ref_img_path).convert('RGB')
+            ref_pil = ref_pil.resize((self.target_w, self.target_h), PILImage.LANCZOS)
+            ref_frame = torch.from_numpy(np.array(ref_pil)).permute(2, 0, 1).float() / 255.0
+            ref_frame = (ref_frame - 0.5) * 2  # C, H, W
         else:
-            ref_offset = random.randint(0, total_video_frames - 1)
-        ref_video = self._load_video_frames(video_path, ref_offset, 1)
-        ref_frame = F.interpolate(
-            ref_video, size=(self.target_h, self.target_w),
-            mode='bilinear', align_corners=False
-        )  # 1, C, H, W
+            # Fallback: sample from a temporally adjacent region (paper M3)
+            seg_start = start_frame
+            seg_end = start_frame + needed_frames - 1
+            nb = max(0, int(self.ref_neighbor_frames))
+            left_lo = max(0, seg_start - nb)
+            left_hi = max(0, seg_start - 1)
+            right_lo = min(total_video_frames - 1, seg_end + 1)
+            right_hi = min(total_video_frames - 1, seg_end + nb)
+            candidates: List[int] = []
+            if left_lo <= left_hi:
+                candidates.append(random.randint(left_lo, left_hi))
+            if right_lo <= right_hi:
+                candidates.append(random.randint(right_lo, right_hi))
+            if candidates:
+                ref_offset = random.choice(candidates)
+            else:
+                ref_offset = random.randint(0, total_video_frames - 1)
+            ref_video = self._load_video_frames(video_path, ref_offset, 1)
+            ref_frame = F.interpolate(
+                ref_video, size=(self.target_h, self.target_w),
+                mode='bilinear', align_corners=False
+            ).squeeze(0)  # C, H, W
 
         # Extract audio window for the FULL needed frames
         audio_window_indices = (torch.arange(self.audio_window) - self.audio_window // 2)
@@ -591,6 +601,7 @@ class InfiniteTalkDataset(Dataset):
             'ref_frame': ref_frame.squeeze(0),  # C, H, W
             'audio_emb_full': full_audio_emb_segment,  # needed_frames, window, 12, 768
             'prompt': prompt,
+            'ref_image_name': ref_image_name or '',  # Used as cache key for CLIP/text embeddings
         }
 
 
@@ -856,8 +867,12 @@ def train(args):
     patch_size = (1, 2, 2)
     # Dynamically select shift based on training resolution (480P vs 720P range)
     area = args.target_w * args.target_h
-    shift = 11.0 if area > 600000 else 7.0
-    logging.info(f"Target resolution {args.target_w}x{args.target_h} (Area: {area}), using shift={shift}")
+    if args.override_shift is not None:
+        shift = float(args.override_shift)
+        logging.info(f"Target resolution {args.target_w}x{args.target_h} (Area: {area}), override shift={shift}")
+    else:
+        shift = 11.0 if area > 600000 else 7.0
+        logging.info(f"Target resolution {args.target_w}x{args.target_h} (Area: {area}), using shift={shift}")
 
     # ---- Timestep bias sampler (AI Toolkit style) ----
     # high_noise : current behavior, shift=11, skews >87% of steps toward t>917 (learns structure/motion)
@@ -903,6 +918,36 @@ def train(args):
         if any(p.requires_grad for p in module.parameters(recurse=False)):
             module.train()
             
+    # ---- Cache CLIP visual and text embeddings ----
+    # Since ref_image is fixed per expression group and prompt is fixed,
+    # we can pre-compute these once and reuse them every step.
+    # Dropout is handled by zeroing the cached result at runtime.
+    clip_cache: Dict[str, torch.Tensor] = {}   # ref_image_name → clip_fea
+    text_cache: Dict[str, List[torch.Tensor]] = {}  # prompt_str → context_list
+    y_cond_cache: Dict[str, torch.Tensor] = {}  # ref_image_name → y_cond (ref frame VAE latent + mask, CPU)
+
+    def get_clip_features(ref_frame_tensor: torch.Tensor, ref_image_name: str = None) -> torch.Tensor:
+        """Get CLIP visual features, using cache if available."""
+        if ref_image_name and ref_image_name in clip_cache:
+            return clip_cache[ref_image_name].to(device).to(torch.bfloat16)
+        # Compute and cache
+        with torch.no_grad():
+            ref_for_clip_cpu = ref_frame_tensor.unsqueeze(0).unsqueeze(2).to('cpu')
+            clip_fea = clip_model.visual(ref_for_clip_cpu).to(device).to(torch.bfloat16)
+        if ref_image_name:
+            clip_cache[ref_image_name] = clip_fea.cpu()  # Cache on CPU to save VRAM
+        return clip_fea
+
+    def get_text_features(prompt_str: str) -> List[torch.Tensor]:
+        """Get text encoder output, using cache if available."""
+        if prompt_str in text_cache:
+            return [t.to(device) for t in text_cache[prompt_str]]
+        # Compute and cache
+        with torch.no_grad():
+            context_list = [t.to(device) for t in text_encoder([prompt_str], torch.device('cpu'))]
+        text_cache[prompt_str] = [t.cpu() for t in context_list]  # Cache on CPU
+        return context_list
+
     progress_bar = tqdm(total=args.max_steps, initial=current_step, desc="Training steps")
 
     while current_step < args.max_steps:
@@ -961,9 +1006,6 @@ def train(args):
                         x_context = x_combined[:, :context_latent_frames]
                         x_1 = x_combined[:, context_latent_frames:]
                     
-                    # [VRAM Maintenance]
-                    torch.cuda.empty_cache()
-                    gc.collect()
 
                     total_latents = x_context.shape[1] + x_1.shape[1]
                     # Audio length must identically align with the exact sequence loaded (args.frame_num)
@@ -971,35 +1013,48 @@ def train(args):
 
                 C_lat, _, lat_h, lat_w = x_1.shape[0], x_1.shape[1], x_1.shape[2], x_1.shape[3]
 
-                # Build reference condition z2 + mask m to exactly match total_latents.
-                with torch.no_grad():
-                    # To exactly match unmodified inference, we must construct the condition
-                    # by padding the reference frame with zeros in pixel space and encoding it.
-                    ref_frame_batch = ref_frame.unsqueeze(0).unsqueeze(2).to(device)  # 1, C_img, 1, H, W
-                    pixel_frame_num = args.frame_num
-                    video_frames_pad = torch.zeros(
-                        1, 3, pixel_frame_num - 1, ref_frame.shape[1], ref_frame.shape[2], device=device
-                    )
-                    padding_frames_pixels = torch.cat([ref_frame_batch, video_frames_pad], dim=2)
-                    
-                    y = vae.encode(padding_frames_pixels)
-                    y_latent = torch.stack(y)[0]  # C_lat, T_lat, lat_h, lat_w
-                    
-                # Construct mask exactly matching inference logic
-                msk_inf = torch.ones(1, pixel_frame_num, lat_h, lat_w, device=device)
-                msk_inf[:, 1:] = 0
-                msk_inf = torch.concat([
-                    torch.repeat_interleave(msk_inf[:, 0:1], repeats=4, dim=1), msk_inf[:, 1:]
-                ], dim=1)
-                msk_inf = msk_inf.view(1, msk_inf.shape[1] // 4, 4, lat_h, lat_w)
-                msk = msk_inf.transpose(1, 2)[0]  # 4, T_lat, lat_h, lat_w
-                
-                y_cond = torch.cat([msk, y_latent], dim=0).to(torch.bfloat16)
+            # Extract ref_image_name here so it's available for both y_cond and CLIP caches
+            ref_image_name = batch.get('ref_image_name', None)
+            if isinstance(ref_image_name, (list, tuple)):
+                ref_image_name = ref_image_name[0]
+            if not ref_image_name:  # empty string fallback
+                ref_image_name = None
+
+            with torch.no_grad():
+                # y_cond only depends on (ref_image, frame_num) — both are fixed during training.
+                # We cache it on CPU to avoid re-running a large VAE encode every step.
+                _y_cond_key = f"{ref_image_name}_{args.frame_num}"
+                if _y_cond_key in y_cond_cache:
+                    y_cond = y_cond_cache[_y_cond_key].to(device)
+                else:
+                    with torch.no_grad():
+                        ref_frame_batch = ref_frame.unsqueeze(0).unsqueeze(2).to(device)  # 1, C_img, 1, H, W
+                        pixel_frame_num = args.frame_num
+                        video_frames_pad = torch.zeros(
+                            1, 3, pixel_frame_num - 1, ref_frame.shape[1], ref_frame.shape[2], device=device
+                        )
+                        padding_frames_pixels = torch.cat([ref_frame_batch, video_frames_pad], dim=2)
+                        y = vae.encode(padding_frames_pixels)
+                        y_latent = torch.stack(y)[0]  # C_lat, T_lat, lat_h, lat_w
+
+                    # Construct mask exactly matching inference logic
+                    msk_inf = torch.ones(1, pixel_frame_num, lat_h, lat_w, device=device)
+                    msk_inf[:, 1:] = 0
+                    msk_inf = torch.concat([
+                        torch.repeat_interleave(msk_inf[:, 0:1], repeats=4, dim=1), msk_inf[:, 1:]
+                    ], dim=1)
+                    msk_inf = msk_inf.view(1, msk_inf.shape[1] // 4, 4, lat_h, lat_w)
+                    msk = msk_inf.transpose(1, 2)[0]  # 4, T_lat, lat_h, lat_w
+                    y_cond = torch.cat([msk, y_latent], dim=0).to(torch.bfloat16)
+                    y_cond_cache[_y_cond_key] = y_cond.cpu()  # Cache on CPU
+                    logging.info(f"  y_cond cached for key: {_y_cond_key}")
 
             # ---- CLIP and Text (Shared) ----
             # ---- CFG dropout (train-time) ----
             drop_text = False
             drop_audio = False
+            drop_clip = False
+            drop_ref = False
             r_cfg = random.random()
             if r_cfg < args.cfg_drop_both_prob:
                 drop_text = True
@@ -1009,22 +1064,35 @@ def train(args):
             elif r_cfg < args.cfg_drop_both_prob + args.cfg_drop_text_prob + args.cfg_drop_audio_prob:
                 drop_audio = True
 
+            # CLIP visual dropout: forces model to rely on LoRA for identity
+            if random.random() < args.cfg_drop_clip_prob:
+                drop_clip = True
+
+            # Reference frame VAE dropout: forces model to learn identity from LoRA weights
+            if random.random() < args.cfg_drop_ref_prob:
+                drop_ref = True
+
             if drop_audio:
                 audio_input = torch.zeros_like(audio_input)
 
             with torch.no_grad():
-                # [VRAM Optimize] CLIP and Text encoding strictly on CPU
-                ref_for_clip_cpu = ref_frame.unsqueeze(0).unsqueeze(2).to('cpu')
-                # clip_model is already permanently offloaded to CPU
-                clip_fea = clip_model.visual(ref_for_clip_cpu).to(device).to(torch.bfloat16)
+                # Use cached CLIP features (computed once per unique ref image)
+                clip_fea = get_clip_features(ref_frame, ref_image_name)
 
-                prompt_list = prompt_batch
-                if drop_text:
-                    prompt_list = [""] * len(prompt_list)
-                
-                # text_encoder is on CPU, just move results back
-                context_list = [t.to(device) for t in text_encoder(prompt_list, torch.device('cpu'))]
+                # Drop CLIP visual features: forces LoRA to carry identity
+                if drop_clip:
+                    clip_fea = torch.zeros_like(clip_fea)
+
+                # Use cached text features (computed once per unique prompt)
+                prompt_list = prompt_batch if not drop_text else [""] * len(prompt_batch)
+                context_list = get_text_features(prompt_list[0]) if len(set(prompt_list)) == 1 \
+                    else [t.to(device) for t in text_encoder(prompt_list, torch.device('cpu'))]
+
                 human_mask = torch.ones([lat_h, lat_w], device=device).unsqueeze(0).repeat(3, 1, 1).float()
+
+            # Drop reference frame VAE condition: replace with noise latent
+            if drop_ref:
+                y_cond = torch.randn_like(y_cond)
 
             # ---- Flow matching interpolation ----
             x_0 = torch.randn_like(x_1)
@@ -1073,7 +1141,7 @@ def train(args):
                     assert t_lat == x_context.shape[1] + x_1.shape[1]
 
             # ---- Forward pass ----
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             T_total = x_input.shape[1]
             max_seq_len = T_total * lat_h * lat_w // (patch_size[1] * patch_size[2])
 
@@ -1118,11 +1186,14 @@ def train(args):
                 writer.add_scalar("train/is_continuation", 1.0 if is_continuation else 0.0, current_step)
                 writer.add_scalar("train/cfg_drop_text", 1.0 if drop_text else 0.0, current_step)
                 writer.add_scalar("train/cfg_drop_audio", 1.0 if drop_audio else 0.0, current_step)
+                writer.add_scalar("train/cfg_drop_clip", 1.0 if drop_clip else 0.0, current_step)
+                writer.add_scalar("train/cfg_drop_ref", 1.0 if drop_ref else 0.0, current_step)
                 writer.add_scalar("train/timestep_frac", float(t_frac.item()), current_step)
                 writer.add_scalar("train/timestep_bias_high_noise", 1.0 if active_bias == 'high_noise' else 0.0, current_step)
                 if grad_norm_val is not None:
                     writer.add_scalar("train/grad_norm", float(grad_norm_val), current_step)
-                writer.flush()
+                if current_step % args.log_every == 0:
+                    writer.flush()
 
             # ---- Logging ----
             if current_step % args.log_every == 0:
@@ -1250,6 +1321,18 @@ def parse_args():
         help="Train-time CFG dropout: probability to drop both text and audio conditions.",
     )
     parser.add_argument(
+        "--cfg_drop_clip_prob",
+        type=float,
+        default=0.1,
+        help="Train-time dropout: probability to drop CLIP visual features. Forces LoRA to learn identity independently of reference image.",
+    )
+    parser.add_argument(
+        "--cfg_drop_ref_prob",
+        type=float,
+        default=0.05,
+        help="Train-time dropout: probability to drop reference frame VAE condition. Forces LoRA to carry identity information.",
+    )
+    parser.add_argument(
         "--resume_from",
         type=str,
         default=None,
@@ -1258,6 +1341,8 @@ def parse_args():
 
     parser.add_argument("--override_lr", action=argparse.BooleanOptionalAction, default=False,
                         help="Force override the resumed optimizer's learning rate with the CLI values.")
+    parser.add_argument("--override_shift", type=float, default=None,
+                        help="Force override the auto-selected shift value. Use 11 for 1080 inference consistency, even when training at lower resolution (e.g. stage1 832x528).")
 
     # Timestep bias (AI Toolkit style two-stage training)
     parser.add_argument(

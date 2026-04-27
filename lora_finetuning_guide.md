@@ -80,6 +80,9 @@ python train_lora.py \
     --cfg_drop_text_prob 0.1 \
     --cfg_drop_audio_prob 0.1 \
     --cfg_drop_both_prob 0.05 \
+    --cfg_drop_clip_prob 0.1 \
+    --cfg_drop_ref_prob 0.05 \
+    --override_shift 11 \
     --use_8bit_optim \
     --blocks_to_swap 38 \
     --gradient_checkpointing \
@@ -102,8 +105,12 @@ python train_lora.py \
     - 注：帧数必须为 `4n+1`，如 17, 33, 49, 65...
 - `--max_steps`: **推荐 5000 左右**。由于在 target_modules 里加入了视觉大层（全方位记忆和神态复刻），可训练参数翻了几倍，因而需要比原来单训嘴巴（1000步）稍长一点的训练时间才能把长相“吃透”。
 - `--target_h / --target_w`: 训练输入的分辨率。**必须严格是 16 的倍数！**（例如 `1024x720`）。注：脚本已会自动针对高分辨率进行流匹配校准，当分辨率面积大于 60万 像素时，会自动把 `shift` 从默认的7调整为11，以获得最佳的高清去噪效果。建议设置与 `prepare_data.py` 预处理的分辨率保持一致。
+- `--override_shift`: **强制指定 shift 值**。推理 1080 时 shift=11，如果训练用低分辨率（如 832×528），自动 shift=7，和推理不匹配。加 `--override_shift 11` 强制使用 shift=11，确保训练和推理的噪声调度一致。
 - `--ref_neighbor_frames`: 参考帧采样窗口（单位：帧）。训练时参考帧会从当前片段左右相邻区域采样（论文 M3 思路），避免控制过强/过弱。默认 25（约 1 秒）。
 - `--cfg_drop_text_prob / --cfg_drop_audio_prob / --cfg_drop_both_prob`: CFG dropout 概率，三者之和必须小于等于 1。
+- `--cfg_drop_clip_prob`: **人物ID克隆的关键参数**。训练时随机将 CLIP 视觉特征置零，迫使模型学会从 LoRA 权重中获取人物身份信息，而非完全依赖参考图。推荐 0.1。如果不开启，推理时 LoRA 的身份特征会被参考图条件"覆盖"，导致微调人物不像训练数据（需要 lora_scale > 2.0 才勉强有效）。
+- `--cfg_drop_ref_prob`: **人物ID克隆的关键参数**。训练时随机将参考帧 VAE 编码替换为噪声，迫使模型在无参考图时也能生成正确的人物长相。推荐 0.05（过高会导致训练不稳定）。
+- **`ref_image` 字段（metadata.json）**: 每个训练样本可指定固定参考图，放在 `data_dir/ref_images/` 目录下。按表情分组，同组视频用同一张参考图（如严肃视频用严肃参考图、微笑视频用微笑参考图）。这样 LoRA 身份信号稳定，且推理时换不同表情参考图也能保持身份一致。不指定则回退到视频邻域帧采样。
 - `--lora_rank / --lora_alpha`: **强烈推荐提升为 64**。因为你现在彻底解冻了庞大的视觉全局通道（`self_attn`, `ffn`）来复刻精确的ID长相和皮肤质感，32 的容量可能在眼颊微表情上显得捉襟见肘。直接拉到 64 能赋予模型更强大的记忆“照片级细节”的能力。
 - `--quant fp8`: **必须开启**。使用 FP8 Monkey Patch 加速并极大压缩 base 模型显存，是 RTX 5090 运行 14B 模型的关键。
 - `override_lr`: 在微调之后发现步数不够的时候启用，因为学习率已经衰减没了，如果不重置学习率，再额外加步数就没用了
