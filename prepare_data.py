@@ -27,8 +27,13 @@ import numpy as np
 from pathlib import Path
 from tqdm import tqdm
 
-def get_crop_params(video_path, target_w, target_h):
-    """Detect person/face and calculate crop dimensions using YOLO or MediaPipe."""
+def get_crop_params(video_path, target_h):
+    """Detect person and calculate crop dimensions to ensure 50px padding on all sides.
+    
+    Args:
+        target_h: Target output height (e.g., 1024). Width is calculated automatically
+            to maintain original video aspect ratio.
+    """
     import cv2
     import os
 
@@ -40,7 +45,9 @@ def get_crop_params(video_path, target_w, target_h):
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    target_ratio = target_w / target_h
+    target_h = target_h // 2 * 2  # ensure even
+
+    print(f"  Source: {w}x{h}, target height: {target_h}")
 
     # 寻找一个包含人物的“锚点帧”（避免第一帧是全黑或渐显）
     # 一旦找到，就会计算出全局唯一的裁切框，应用到整个视频
@@ -83,68 +90,49 @@ def get_crop_params(video_path, target_w, target_h):
                     person_xmin, person_ymin, person_xmax, person_ymax = x1, y1, x2, y2
             
             if largest_area > 0:
-                print(f"  YOLO anchor frame found at idx {check_idx}: size {int(person_xmax-person_xmin)}x{int(person_ymax-person_ymin)}")
+                print(f"  YOLO anchor frame found at idx {check_idx}: "
+                      f"bbox ({int(person_xmin)},{int(person_ymin)}) → ({int(person_xmax)},{int(person_ymax)}) "
+                      f"size {int(person_xmax-person_xmin)}x{int(person_ymax-person_ymin)}")
                 person_found = True
-                break  # 找到一个有效帧就立刻退出，保证只生成一个静态裁切框
+                
+                person_w_box = int(person_xmax - person_xmin)
+                person_h_box = int(person_ymax - person_ymin)
+
+                # Step 1: Add 50px padding on all sides in SOURCE space
+                pad_src = 50
+                crop_x = int(person_xmin) - pad_src
+                crop_y = int(person_ymin) - pad_src
+                crop_w = person_w_box + 2 * pad_src
+                crop_h = person_h_box + 2 * pad_src
+
+                # Step 2: Clamp to video boundaries
+                crop_x = max(0, crop_x)
+                crop_y = max(0, crop_y)
+                crop_w = min(crop_w, w - crop_x)
+                crop_h = min(crop_h, h - crop_y)
+
+                # Ensure even dimensions for video codecs
+                crop_w = crop_w // 2 * 2
+                crop_h = crop_h // 2 * 2
+
+                # Step 3: Scale so output height = target_h, maintain aspect ratio
+                scale = target_h / crop_h
+                out_w = int(crop_w * scale) // 2 * 2  # ensure even
+
+                print(f"  Person bbox: {person_w_box}x{person_h_box} + {pad_src}px padding each side")
+                print(f"  Crop region (source): {crop_w}x{crop_h} @ ({crop_x},{crop_y})")
+                print(f"  Output: {out_w}x{target_h} (scale={scale:.3f})")
+
+                cap.release()
+                return crop_w, crop_h, crop_x, crop_y, out_w, target_h
                 
     cap.release()
     
-    if person_found:
-        person_w_box = person_xmax - person_xmin
-        person_h_box = person_ymax - person_ymin
-        
-        # Add padding (10% of width/height) for "留白"
-        padding_x = person_w_box * 0.10
-        padding_y = person_h_box * 0.10
-        
-        person_top = max(0, person_ymin - padding_y)
-        person_bottom = min(h, person_ymax + padding_y)
-        person_left = max(0, person_xmin - padding_x)
-        person_right = min(w, person_xmax + padding_x)
-        
-        min_crop_w = person_right - person_left
-        min_crop_h = person_bottom - person_top
-        cx = (person_left + person_right) / 2
-        
-        # Calculate crop dimensions satisfying target_ratio
-        # Determine the binding dimension: whichever side needs more expansion drives the crop size
-        crop_by_h = min_crop_h * target_ratio  # width needed if height is the limit
-        crop_by_w = min_crop_w / target_ratio  # height needed if width is the limit
-        
-        if crop_by_h >= min_crop_w:
-            # Height is the binding dimension: set height, derive width
-            crop_h = min_crop_h
-            crop_w = crop_by_h
-        else:
-            # Width is the binding dimension: set width, derive height
-            crop_w = min_crop_w
-            crop_h = crop_by_w
-        
-        # Clamp to video boundaries, maintaining ratio
-        if crop_h > h:
-            crop_h = h
-            crop_w = crop_h * target_ratio
-        if crop_w > w:
-            crop_w = w
-            crop_h = crop_w / target_ratio
-            
-        crop_h = int(crop_h)
-        crop_w = int(crop_w)
-        
-        crop_x = int(cx - crop_w / 2)
-        extra_h = max(0, crop_h - min_crop_h)
-        crop_y = int(person_top - extra_h * 0.5)
-        
-        crop_x = max(0, min(crop_x, w - crop_w))
-        crop_y = max(0, min(crop_y, h - crop_h))
-        
-        return crop_w, crop_h, crop_x, crop_y
-    else:
-        raise RuntimeError(
-            f"YOLO found no person in any of the anchor frames {anchor_frames} of:\n  {video_path}\n"
-            f"Please check that the video contains a clearly visible person, "
-            f"or delete this video from the input directory."
-        )
+    raise RuntimeError(
+        f"YOLO found no person in any of the anchor frames {anchor_frames} of:\n  {video_path}\n"
+        f"Please check that the video contains a clearly visible person, "
+        f"or delete this video from the input directory."
+    )
 
 
 def extract_audio_from_video(video_path, target_sr=16000):
@@ -374,10 +362,10 @@ def main():
     parser.add_argument("--prompt", type=str, default="A news anchor is broadcasting.",
                         help="Default text prompt for all videos")
     parser.add_argument("--device", type=str, default="cuda:0")
-    parser.add_argument("--target_h", type=int, default=832,
-                        help="Target height for cropped video")
-    parser.add_argument("--target_w", type=int, default=480,
-                        help="Target width for cropped video")
+    parser.add_argument("--target_h", type=int, default=1024,
+                        help="Target output height (e.g., 1024). "
+                             "Width is calculated automatically to maintain aspect ratio. "
+                             "Person will have 50px padding on all sides in output space.")
     parser.add_argument("--force_recrop", action="store_true",
                         help="Force re-cropping even if processed video already exists.")
     args = parser.parse_args()
@@ -421,13 +409,13 @@ def main():
                 if args.force_recrop and os.path.exists(dst_video):
                     print(f"\n  [force_recrop] Removing existing video: {dst_video}")
                     os.remove(dst_video)
-                print(f"\n  Analyzing {video_file} for face-center crop...")
-                # get_crop_params raises RuntimeError if no person detected — no fallback
-                cw, ch, cx, cy = get_crop_params(video_path, args.target_w, args.target_h)
-                vf_filter = f"crop={cw}:{ch}:{cx}:{cy},scale={args.target_w}:{args.target_h}"
-                print(f"  Crop box: x={cx} y={cy} w={cw} h={ch} → scale to {args.target_w}x{args.target_h}")
+                print(f"\n  Analyzing {video_file} for person-center crop...")
+                # get_crop_params returns crop box and calculated output width
+                cw, ch, cx, cy, target_w, target_h = get_crop_params(video_path, args.target_h)
+                vf_filter = f"crop={cw}:{ch}:{cx}:{cy},scale={target_w}:{target_h}"
+                print(f"  Crop box: x={cx} y={cy} w={cw} h={ch} → scale to {target_w}x{target_h}")
                 
-                print(f"  Cropping to {args.target_w}x{args.target_h} & Forcing 25 FPS...")
+                print(f"  Cropping & scaling to {target_w}x{target_h} @ 25 FPS...")
                 import subprocess
                 cmd = [
                     'ffmpeg', '-y', '-i', video_path,
@@ -446,7 +434,7 @@ def main():
             # 2. Get info from the *processed* standardized video
             info = get_video_info(dst_video)
             print(f"\n  Processed {out_video_name}: {info['duration']:.1f}s, {info['fps']:.0f}fps, "
-                  f"{info['width']}x{info['height']}")
+                  f"{info['width']}x{info['height']} (height {args.target_h})")
 
             # 3 & 4. Extract audio + wav2vec2 embeddings (skip if already exists)
             emb_file = f"{stem}.pt"
@@ -470,10 +458,11 @@ def main():
                 print(f"  Embedding already exists, loaded: {emb_file} shape={audio_emb.shape}")
 
             # 5. Auto-select best reference frame (front-facing, mouth closed, sharp)
+            # Use actual dimensions from processed video (may vary per video based on aspect ratio)
             ref_image_name = f"{stem}_ref.jpg"
             ref_image_path = os.path.join(args.output_dir, 'ref_images', ref_image_name)
             if not os.path.exists(ref_image_path):
-                best_frame = select_best_ref_frame(dst_video, args.target_w, args.target_h)
+                best_frame = select_best_ref_frame(dst_video, info['width'], info['height'])
                 if best_frame is not None:
                     import cv2 as cv2_ref
                     cv2_ref.imwrite(ref_image_path, best_frame)

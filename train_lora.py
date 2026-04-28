@@ -481,13 +481,11 @@ class InfiniteTalkDataset(Dataset):
             self,
             data_dir,
             frame_num=33,
-            target_size=(832, 480),
             audio_window=5,
             ref_neighbor_frames: int = 25,
     ):
         self.data_dir = data_dir
         self.frame_num = frame_num
-        self.target_h, self.target_w = target_size
         self.audio_window = audio_window
         self.ref_neighbor_frames = ref_neighbor_frames
 
@@ -548,12 +546,7 @@ class InfiniteTalkDataset(Dataset):
         _vr = VideoReader(video_path, ctx=decord_cpu(0))
         total_video_frames = len(_vr)
         del _vr
-        video_full = self._load_video_frames(video_path, start_frame, needed_frames)
-        # Resize to target size
-        video_full = F.interpolate(
-            video_full, size=(self.target_h, self.target_w),
-            mode='bilinear', align_corners=False
-        )  # T_full, C, H, W (needed_frames, 3, H, W)
+        video_full = self._load_video_frames(video_path, start_frame, needed_frames)  # T_full, C, H, W
 
         # Reference frame for identity
         ref_image_name = sample.get('ref_image', None)
@@ -562,7 +555,6 @@ class InfiniteTalkDataset(Dataset):
             from PIL import Image as PILImage
             ref_img_path = os.path.join(self.data_dir, 'ref_images', ref_image_name)
             ref_pil = PILImage.open(ref_img_path).convert('RGB')
-            ref_pil = ref_pil.resize((self.target_w, self.target_h), PILImage.LANCZOS)
             ref_frame = torch.from_numpy(np.array(ref_pil)).permute(2, 0, 1).float() / 255.0
             ref_frame = (ref_frame - 0.5) * 2  # C, H, W
         else:
@@ -584,10 +576,7 @@ class InfiniteTalkDataset(Dataset):
             else:
                 ref_offset = random.randint(0, total_video_frames - 1)
             ref_video = self._load_video_frames(video_path, ref_offset, 1)
-            ref_frame = F.interpolate(
-                ref_video, size=(self.target_h, self.target_w),
-                mode='bilinear', align_corners=False
-            ).squeeze(0)  # C, H, W
+            ref_frame = ref_video.squeeze(0)  # C, H, W
 
         # Extract audio window for the FULL needed frames
         audio_window_indices = (torch.arange(self.audio_window) - self.audio_window // 2)
@@ -848,7 +837,6 @@ def train(args):
     dataset = InfiniteTalkDataset(
         data_dir=args.data_dir,
         frame_num=args.frame_num,
-        target_size=(args.target_h, args.target_w),
         audio_window=cfg.get('audio_window', 5) if hasattr(cfg, 'get') else 5,
         ref_neighbor_frames=args.ref_neighbor_frames,
     )
@@ -865,14 +853,9 @@ def train(args):
     num_timesteps = 1000
     vae_stride = (4, 8, 8)
     patch_size = (1, 2, 2)
-    # Dynamically select shift based on training resolution (480P vs 720P range)
-    area = args.target_w * args.target_h
-    if args.override_shift is not None:
-        shift = float(args.override_shift)
-        logging.info(f"Target resolution {args.target_w}x{args.target_h} (Area: {area}), override shift={shift}")
-    else:
-        shift = 11.0 if area > 600000 else 7.0
-        logging.info(f"Target resolution {args.target_w}x{args.target_h} (Area: {area}), using shift={shift}")
+    # Fixed shift=11.0 to match inference behavior regardless of resolution
+    shift = 11.0
+    logging.info(f"Using fixed shift={shift}")
 
     # ---- Timestep bias sampler (AI Toolkit style) ----
     # high_noise : current behavior, shift=11, skews >87% of steps toward t>917 (learns structure/motion)
@@ -1289,10 +1272,6 @@ def parse_args():
     parser.add_argument("--blocks_to_swap", type=int, default=0, help="Number of frozen transformer blocks to swap to CPU during forward/backward to save VRAM (max num_blocks-1)")
     parser.add_argument("--first_clip_prob", type=float, default=0.2,
                         help="Probability of sampling first-clip training branch. Continuation prob is 1-p.")
-    parser.add_argument("--target_h", type=int, default=832,
-                        help="Target height. Recommend 832 for vertical 480P bucket")
-    parser.add_argument("--target_w", type=int, default=480,
-                        help="Target width. Recommend 480 for vertical 480P bucket")
     parser.add_argument("--gradient_checkpointing", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--use_amp", action=argparse.BooleanOptionalAction, default=True,
                         help="Use BF16 mixed precision")

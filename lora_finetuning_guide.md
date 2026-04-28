@@ -54,7 +54,7 @@ python prepare_data.py \
 ```
 > **输出规范与同步保障**：该脚本会统一将帧率严格重采样为 25fps，并强制将音频转码为高兼容、精确对齐时间戳的 `aac` 格式，彻底解决了 Windows 自带播放器报 `ipcm` 错误导致的无声或噪音乱码问题。最终生成统一的 `videos`、`audio_embs` 及 `metadata.json`。
 > **提示词（Prompt）秘籍**：千万别再使用泛泛而谈的 `A person is talking.`！由于底模本身表现欲极强，提示词一定要往端庄、安静、冷感的方向引导，比如使用 `A professional news anchor is broadcasting, sitting completely still, hands kept down.`。正向精准词+训练强大的视觉 LoRA，能彻底根治生成的视频乱挥手的问题。
-> **注**：宽高必须是16的倍数，否则会报错。
+> **注**：宽高必须是16的倍数，否则会报错。`prepare_data.py` 完成后，视频帧已保存为目标分辨率，训练脚本直接读取，**无需**在 `train_lora.py` 中再次指定宽高。
 
 ## 3. 启动训练
 
@@ -74,15 +74,12 @@ python train_lora.py \
     --max_steps 5000 \
     --bias_switch_step 2500 \
     --frame_num 33 \
-    --target_h 1024 \
-    --target_w 656 \
     --ref_neighbor_frames 25 \
     --cfg_drop_text_prob 0.1 \
     --cfg_drop_audio_prob 0.1 \
     --cfg_drop_both_prob 0.05 \
     --cfg_drop_clip_prob 0.1 \
     --cfg_drop_ref_prob 0.05 \
-    --override_shift 11 \
     --use_8bit_optim \
     --blocks_to_swap 38 \
     --gradient_checkpointing \
@@ -93,8 +90,6 @@ python train_lora.py \
     --debug_assert_shapes
 ```
 
-> **注**：宽高必须是16的倍数，否则会报错。
-
 ### 参数建议：
 - `--no-train_audio`: 默认不训练音频层，如果口型对不上的时候开启。炼人物一致性音频层作用不大
 - `--blocks_to_swap`: **显存救星，强烈建议开启**。如果不开启，加入全局视觉特征层（self_attn/ffn）后会立刻爆显存。建议设置为 `20 到 35` 之间（如 25）。它会将指定数量的 DiT Block 参数暂存至内存，牺牲轻微的速度换取极大的显存空间。
@@ -104,8 +99,8 @@ python train_lora.py \
     - **49 (推荐/画质优先)**: 约占 27-30GB 显存，涵盖近 2 秒视频，能学到更好的连贯性。
     - 注：帧数必须为 `4n+1`，如 17, 33, 49, 65...
 - `--max_steps`: **推荐 5000 左右**。由于在 target_modules 里加入了视觉大层（全方位记忆和神态复刻），可训练参数翻了几倍，因而需要比原来单训嘴巴（1000步）稍长一点的训练时间才能把长相“吃透”。
-- `--target_h / --target_w`: 训练输入的分辨率。**必须严格是 16 的倍数！**（例如 `1024x720`）。注：脚本已会自动针对高分辨率进行流匹配校准，当分辨率面积大于 60万 像素时，会自动把 `shift` 从默认的7调整为11，以获得最佳的高清去噪效果。建议设置与 `prepare_data.py` 预处理的分辨率保持一致。
-- `--override_shift`: **强制指定 shift 值**。推理 1080 时 shift=11，如果训练用低分辨率（如 832×528），自动 shift=7，和推理不匹配。加 `--override_shift 11` 强制使用 shift=11，确保训练和推理的噪声调度一致。
+- **分辨率**：`train_lora.py` 不再接受 `--target_h / --target_w` 参数。训练帧尺寸完全由 `prepare_data.py` 的输出决定，训练时直接读取，无需重新指定。分辨率在 `prepare_data.py` 阶段确定即可，**必须是 16 的倍数**（例如 `1024x656`）。
+- **Shift**：固定为 `11.0`，与推理侧完全一致，无需手动指定，已移除 `--override_shift` 参数。
 - `--ref_neighbor_frames`: 参考帧采样窗口（单位：帧）。训练时参考帧会从当前片段左右相邻区域采样（论文 M3 思路），避免控制过强/过弱。默认 25（约 1 秒）。
 - `--cfg_drop_text_prob / --cfg_drop_audio_prob / --cfg_drop_both_prob`: CFG dropout 概率，三者之和必须小于等于 1。
 - `--cfg_drop_clip_prob`: **人物ID克隆的关键参数**。训练时随机将 CLIP 视觉特征置零，迫使模型学会从 LoRA 权重中获取人物身份信息，而非完全依赖参考图。推荐 0.1。如果不开启，推理时 LoRA 的身份特征会被参考图条件"覆盖"，导致微调人物不像训练数据（需要 lora_scale > 2.0 才勉强有效）。
