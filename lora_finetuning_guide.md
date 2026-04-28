@@ -50,7 +50,6 @@ python prepare_data.py \
     --prompt "A news anchor is broadcasting." \
     --device cuda:0 \
     --target_h 1024 \
-    --target_w 656
 ```
 > **输出规范与同步保障**：该脚本会统一将帧率严格重采样为 25fps，并强制将音频转码为高兼容、精确对齐时间戳的 `aac` 格式，彻底解决了 Windows 自带播放器报 `ipcm` 错误导致的无声或噪音乱码问题。最终生成统一的 `videos`、`audio_embs` 及 `metadata.json`。
 > **提示词（Prompt）秘籍**：千万别再使用泛泛而谈的 `A person is talking.`！由于底模本身表现欲极强，提示词一定要往端庄、安静、冷感的方向引导，比如使用 `A professional news anchor is broadcasting, sitting completely still, hands kept down.`。正向精准词+训练强大的视觉 LoRA，能彻底根治生成的视频乱挥手的问题。
@@ -85,7 +84,7 @@ python train_lora.py \
     --gradient_checkpointing \
     --use_amp \
     --output_dir output/my_lora \
-    --save_every 100 \
+    --save_every 250 \
     --log_every 10 \
     --debug_assert_shapes
 ```
