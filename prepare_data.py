@@ -396,6 +396,31 @@ def main():
         print(f"No video files found in {args.video_dir}")
         return
 
+    # ---- Detect crop params ONCE from the first video's middle frame ----
+    # All videos share the same crop box and output resolution so that
+    # every processed video has identical spatial dimensions.
+    crop_params_path = os.path.join(args.output_dir, 'crop_params.json')
+    if os.path.exists(crop_params_path) and not args.force_recrop:
+        with open(crop_params_path, 'r', encoding='utf-8') as _f:
+            _cp = json.load(_f)
+        global_cw, global_ch, global_cx, global_cy = _cp['cw'], _cp['ch'], _cp['cx'], _cp['cy']
+        global_out_w, global_out_h = _cp['out_w'], _cp['out_h']
+        print(f"Loaded existing crop params from {crop_params_path}: "
+              f"crop {global_cw}x{global_ch}@({global_cx},{global_cy}) → {global_out_w}x{global_out_h}")
+    else:
+        first_video = os.path.join(args.video_dir, video_files[0])
+        print(f"Detecting crop params from first video (middle frame): {video_files[0]}")
+        global_cw, global_ch, global_cx, global_cy, global_out_w, global_out_h = \
+            get_crop_params(first_video, args.target_h)
+        _cp = {'cw': global_cw, 'ch': global_ch, 'cx': global_cx, 'cy': global_cy,
+               'out_w': global_out_w, 'out_h': global_out_h}
+        with open(crop_params_path, 'w', encoding='utf-8') as _f:
+            json.dump(_cp, _f, indent=2)
+        print(f"Saved crop params → {crop_params_path}")
+
+    global_vf_filter = f"crop={global_cw}:{global_ch}:{global_cx}:{global_cy},scale={global_out_w}:{global_out_h}"
+    print(f"Global ffmpeg filter: {global_vf_filter}\n")
+
     samples = []
     for video_file in tqdm(video_files, desc="Processing videos"):
         video_path = os.path.join(args.video_dir, video_file)
@@ -404,22 +429,17 @@ def main():
         dst_video = os.path.join(args.output_dir, 'videos', out_video_name)
 
         try:
-            # 1. Smart Crop Based on Person Detection & Force 25 FPS
+            # 1. Crop & scale using global params detected from first video, Force 25 FPS
             if not os.path.exists(dst_video) or args.force_recrop:
                 if args.force_recrop and os.path.exists(dst_video):
                     print(f"\n  [force_recrop] Removing existing video: {dst_video}")
                     os.remove(dst_video)
-                print(f"\n  Analyzing {video_file} for person-center crop...")
-                # get_crop_params returns crop box and calculated output width
-                cw, ch, cx, cy, target_w, target_h = get_crop_params(video_path, args.target_h)
-                vf_filter = f"crop={cw}:{ch}:{cx}:{cy},scale={target_w}:{target_h}"
-                print(f"  Crop box: x={cx} y={cy} w={cw} h={ch} → scale to {target_w}x{target_h}")
-                
-                print(f"  Cropping & scaling to {target_w}x{target_h} @ 25 FPS...")
+
+                print(f"\n  Processing {video_file}: crop {global_cw}x{global_ch}@({global_cx},{global_cy}) → {global_out_w}x{global_out_h} @ 25 FPS...")
                 import subprocess
                 cmd = [
                     'ffmpeg', '-y', '-i', video_path,
-                    '-vf', vf_filter,
+                    '-vf', global_vf_filter,
                     '-r', '25',  # Standardize all videos to 25 FPS
                     '-c:v', 'libx264', '-preset', 'fast', '-crf', '18',
                     '-c:a', 'aac', '-b:a', '192k',
