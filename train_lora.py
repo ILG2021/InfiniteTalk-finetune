@@ -1126,7 +1126,10 @@ def train(args):
             # ---- Forward pass ----
             optimizer.zero_grad(set_to_none=True)
             T_total = x_input.shape[1]
-            max_seq_len = T_total * lat_h * lat_w // (patch_size[1] * patch_size[2])
+            # Compute seq_len to match exactly how WanModel patchifies the latent:
+            # patchify does (lat_h // p) * (lat_w // p) per frame, NOT lat_h * lat_w // p^2.
+            # These differ when lat_h or lat_w is not divisible by p (off-by-one via floor).
+            max_seq_len = T_total * (lat_h // patch_size[1]) * (lat_w // patch_size[2])
 
             # Gradient checkpointing requires at least one input with requires_grad=True
             # for each checkpointed segment to properly recompute activations (musubi-tuner convention).

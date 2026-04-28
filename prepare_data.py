@@ -45,7 +45,7 @@ def get_crop_params(video_path, target_h):
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    target_h = target_h // 8 * 8  # ensure multiple of 8 (VAE spatial stride)
+    target_h = target_h // 16 * 16  # must be multiple of 16 (VAE stride 8 × patch 2)
 
     print(f"  Source: {w}x{h}, target height: {target_h}")
 
@@ -111,13 +111,13 @@ def get_crop_params(video_path, target_h):
                 crop_w = min(crop_w, w - crop_x)
                 crop_h = min(crop_h, h - crop_y)
 
-                # Ensure dimensions are multiples of 8 for VAE spatial stride
-                crop_w = crop_w // 8 * 8
-                crop_h = crop_h // 8 * 8
+                # Ensure even dimensions for ffmpeg codec
+                crop_w = crop_w // 2 * 2
+                crop_h = crop_h // 2 * 2
 
                 # Step 3: Scale so output height = target_h, maintain aspect ratio
                 scale = target_h / crop_h
-                out_w = int(crop_w * scale) // 8 * 8  # ensure multiple of 8
+                out_w = int(crop_w * scale) // 16 * 16  # must be multiple of 16 (VAE stride 8 × patch 2)
 
                 print(f"  Person bbox: {person_w_box}x{person_h_box} + {pad_src}px padding each side")
                 print(f"  Crop region (source): {crop_w}x{crop_h} @ ({crop_x},{crop_y})")
