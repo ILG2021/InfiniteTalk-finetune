@@ -1,6 +1,5 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import gc
-from inspect import ArgSpec
 import logging
 import json
 import math
@@ -35,6 +34,7 @@ from wan.utils.utils import convert_video_to_h264, extract_specific_frames, get_
 from wan.wan_lora import WanLoraWrapper
 
 from safetensors.torch import load_file
+from .utils.training_memory import FrozenLinear, load_prequantized_fp8, uses_fp32_compute
 from optimum.quanto import quantize, freeze, qint8,requantize
 import optimum.quanto.nn.qlinear as qlinear
 
@@ -43,7 +43,14 @@ def torch_gc():
     torch.cuda.ipc_collect()
 
 def to_param_dtype_fp32only(model, param_dtype):
-    for module in model.modules():
+    for module_name, module in model.named_modules():
+        if isinstance(module, FrozenLinear):
+            continue  # Preserve the source FP8 payload and FP32 scales.
+        if uses_fp32_compute(module_name):
+            for param in module.parameters(recurse=False):
+                if param.is_floating_point():
+                    param.data = param.data.float()
+            continue
         for name, param in module.named_parameters(recurse=False):
             if param.dtype == torch.float32 and param.__class__.__name__ not in ['WeightQBytesTensor']:
                 param.data = param.data.to(param_dtype)
@@ -126,6 +133,8 @@ class InfiniteTalkPipeline:
         quant = None,
         dit_path = None,
         infinitetalk_dir=None,
+        auxiliary_device=None,
+        training_fp8_path=None,
     ):
         r"""
         Initializes the image-to-video generation model components.
@@ -154,6 +163,10 @@ class InfiniteTalkPipeline:
         """
         if quant is not None and quant not in ("int8", "fp8"):
             raise ValueError("quant must be 'int8', 'fp8', or None(default fp32 model)")
+        if training_fp8_path is not None:
+            for required in (training_fp8_path, os.path.splitext(training_fp8_path)[0] + '.json'):
+                if not os.path.isfile(required):
+                    raise FileNotFoundError(f'Missing official FP8 checkpoint or quantization map: {required}')
         self.device = torch.device(f"cuda:{device_id}")
         self.config = config
         self.rank = rank
@@ -180,18 +193,27 @@ class InfiniteTalkPipeline:
         self.patch_size = config.patch_size
         self.vae = WanVAE(
             vae_pth=os.path.join(checkpoint_dir, config.vae_checkpoint),
-            device=self.device)
+            device=self.device if auxiliary_device is None else torch.device(auxiliary_device))
 
         self.clip = CLIPModel(
             dtype=config.clip_dtype,
-            device=self.device,
+            device=self.device if auxiliary_device is None else torch.device(auxiliary_device),
             checkpoint_path=os.path.join(checkpoint_dir,
                                          config.clip_checkpoint),
             tokenizer_path=os.path.join(checkpoint_dir, config.clip_tokenizer))
 
         logging.info(f"Creating WanModel from {checkpoint_dir}")
 
-        if quant is not None:
+        if training_fp8_path is not None:
+            with open(os.path.join(checkpoint_dir, 'config.json'), encoding='utf-8') as handle:
+                wan_config = json.load(handle)
+            with torch.device('meta'):
+                self.model = WanModel(weight_init=False, **wan_config)
+            count = load_prequantized_fp8(self.model, training_fp8_path,
+                                         os.path.splitext(training_fp8_path)[0]+'.json', self.param_dtype)
+            self.model.init_freqs()
+            logging.info('Loaded %d prequantized FP8 layers without requantization', count)
+        elif quant is not None:
             logging.info(f"Loading Quantized MultiTalk from {quant_dir}")
             with torch.device('meta'):
                 wan_config = json.load(open(os.path.join(checkpoint_dir, "config.json")))
@@ -208,7 +230,8 @@ class InfiniteTalkPipeline:
                 init_contexts = [no_init_weights()]
                 init_contexts.append(accelerate.init_empty_weights())
                 wan_config = json.load(open(os.path.join(checkpoint_dir, "config.json")))
-                self.model = WanModel(weight_init=False,**wan_config).to(dtype=self.param_dtype)
+                with ContextManagers(init_contexts):
+                    self.model = WanModel(weight_init=False, **wan_config)
                 weight_files = [f"{checkpoint_dir}/diffusion_pytorch_model-00001-of-00007.safetensors", 
                                 f"{checkpoint_dir}/diffusion_pytorch_model-00002-of-00007.safetensors", 
                                 f"{checkpoint_dir}/diffusion_pytorch_model-00003-of-00007.safetensors", 
@@ -221,7 +244,9 @@ class InfiniteTalkPipeline:
                 for weight_file in weight_files:
                     sd = load_file(weight_file)
                     merged_state_dict.update(sd)
-                self.model.load_state_dict(merged_state_dict)
+                self.model.load_state_dict(merged_state_dict, assign=True)
+                del merged_state_dict, sd
+                self.model.init_freqs()
                 
             else:
                 init_contexts = [no_init_weights()]

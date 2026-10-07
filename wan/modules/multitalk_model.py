@@ -15,6 +15,7 @@ from .attention import flash_attention, SingleStreamMutiAttention
 from ..utils.multitalk_utils import get_attn_map_with_target
 import logging
 from ..utils.offload_utils import ModelOffloader, _clean_memory_on_device
+from ..utils.training_memory import checkpoint_block
 try:
     from sageattention import sageattn
     USE_SAGEATTN = True
@@ -152,7 +153,7 @@ class WanSelfAttention(nn.Module):
         q = rope_apply(q, grid_sizes, freqs)
         k = rope_apply(k, grid_sizes, freqs)
 
-        if USE_SAGEATTN:
+        if USE_SAGEATTN and not torch.is_grad_enabled():
             x = sageattn(q.to(torch.bfloat16), k.to(torch.bfloat16), v, tensor_layout='NHD')
         else:
             x = flash_attention(
@@ -166,9 +167,11 @@ class WanSelfAttention(nn.Module):
         # output
         x = x.flatten(2)
         x = self.o(x)
-        with torch.no_grad():
-            x_ref_attn_map = get_attn_map_with_target(q.type_as(x), k.type_as(x), grid_sizes[0], 
-                                                    ref_target_masks=ref_target_masks)
+        x_ref_attn_map = None
+        if ref_target_masks is not None:
+            with torch.no_grad():
+                x_ref_attn_map = get_attn_map_with_target(q.type_as(x), k.type_as(x), grid_sizes[0],
+                                                        ref_target_masks=ref_target_masks)
 
         return x, x_ref_attn_map
 
@@ -198,7 +201,7 @@ class WanI2VCrossAttention(WanSelfAttention):
         v = self.v(context).view(b, -1, n, d)
         k_img = self.norm_k_img(self.k_img(context_img)).view(b, -1, n, d)
         v_img = self.v_img(context_img).view(b, -1, n, d)
-        if USE_SAGEATTN:
+        if USE_SAGEATTN and not torch.is_grad_enabled():
             img_x = sageattn(q, k_img, v_img, tensor_layout='NHD')
             x = sageattn(q, k, v, tensor_layout='NHD')
         else:   
@@ -288,7 +291,7 @@ class WanAttentionBlock(nn.Module):
 
         dtype = x.dtype
         assert e.dtype == torch.float32
-        with amp.autocast(dtype=torch.float32):
+        with torch.autocast(x.device.type, enabled=False):
             e = (self.modulation.to(e.device) + e).chunk(6, dim=1)
         assert e[0].dtype == torch.float32
 
@@ -338,7 +341,7 @@ class Head(nn.Module):
             e(Tensor): Shape [B, C]
         """
         assert e.dtype == torch.float32
-        with amp.autocast(dtype=torch.float32):
+        with torch.autocast(x.device.type, enabled=False):
             e = (self.modulation.to(e.device) + e.unsqueeze(1)).chunk(2, dim=1)
             x = (self.head(self.norm(x) * (1 + e[1]) + e[0]))
         return x
@@ -418,7 +421,7 @@ class AudioProjModel(ModelMixin, ConfigMixin):
         context_tokens = self.proj3(audio_embeds_c).reshape(batch_size_c*N_t, self.context_tokens, self.output_dim)
 
         # normalization and reshape
-        with amp.autocast(dtype=torch.float32):
+        with torch.autocast(context_tokens.device.type, enabled=False):
             context_tokens = self.norm(context_tokens)
         context_tokens = rearrange(context_tokens, "(bz f) m c -> bz f m c", f=video_length)
 
@@ -652,7 +655,7 @@ class WanModel(ModelMixin, ConfigMixin):
         ])
 
         # time embeddings
-        with amp.autocast(dtype=torch.float32):
+        with torch.autocast(x.device.type, enabled=False):
             e = self.time_embedding(
                 sinusoidal_embedding_1d(self.freq_dim, t).float())
             e0 = self.time_projection(e).unflatten(1, (6, self.dim))
@@ -691,7 +694,8 @@ class WanModel(ModelMixin, ConfigMixin):
 
 
         # convert ref_target_masks to token_ref_target_masks
-        if ref_target_masks is not None:
+        token_ref_target_masks = None
+        if ref_target_masks is not None and human_num > 1:
             ref_target_masks = ref_target_masks.unsqueeze(0).to(torch.float32) 
             token_ref_target_masks = nn.functional.interpolate(ref_target_masks, size=(N_h, N_w), mode='nearest') 
             token_ref_target_masks = token_ref_target_masks.squeeze(0)
@@ -788,8 +792,9 @@ class WanModel(ModelMixin, ConfigMixin):
                     self.offloader.wait_for_block(block_idx)
                 
                 if self.gradient_checkpointing and torch.is_grad_enabled():
-                    x = torch.utils.checkpoint.checkpoint(
-                        block, x, use_reentrant=False, **kwargs)
+                    x = checkpoint_block(
+                        block, x, offload=getattr(self, 'activation_offload', False),
+                        pin_memory=getattr(self, 'activation_offload_pin_memory', False), **kwargs)
                 else:
                     x = block(x, **kwargs)
                     

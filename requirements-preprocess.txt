@@ -1,0 +1,8 @@
+# Install a CUDA-compatible torch/torchvision build first.
+numpy>=1.23.5,<2
+opencv-python>=4.9.0.80
+transformers>=4.57.1,<5
+ultralytics>=8.3,<9
+qwen-vl-utils>=0.0.14,<0.1
+accelerate>=1.0
+torchvision

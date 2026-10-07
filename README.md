@@ -171,14 +171,17 @@ sudo yum install ffmpeg ffmpeg-devel
 | chinese-wav2vec2-base |      🤗 [Huggingface](https://huggingface.co/TencentGameMate/chinese-wav2vec2-base)          | Audio encoder
 | MeiGen-InfiniteTalk      |      🤗 [Huggingface](https://huggingface.co/MeiGen-AI/InfiniteTalk)              | Our audio condition weights
 
-Download models using huggingface-cli:
-``` sh
-huggingface-cli download Wan-AI/Wan2.1-I2V-14B-480P --local-dir ./weights/Wan2.1-I2V-14B-480P
-huggingface-cli download TencentGameMate/chinese-wav2vec2-base --local-dir ./weights/chinese-wav2vec2-base
-huggingface-cli download TencentGameMate/chinese-wav2vec2-base model.safetensors --revision refs/pr/1 --local-dir ./weights/chinese-wav2vec2-base
-huggingface-cli download MeiGen-AI/InfiniteTalk --local-dir ./weights/InfiniteTalk
-
+For this single-person training project, download only the required files:
+```sh
+python -m pip install huggingface_hub
+python download_weights.py --profile training
+python download_weights.py --profile training --download
+python download_weights.py --profile training --check
 ```
+
+The first command to the script prints a plan without downloading. Downloads are pinned to verified repository commits and can be retried using Hugging Face's cache. `--check` checks file presence and nonzero size, not checksums. The wav2vec2 safetensors conversion comes from the same `refs/pr/1` referenced by upstream, pinned to its commit; duplicate `.bin` and fairseq files are excluded. The default training profile downloads the official merged single-person FP8 checkpoint and its quantization JSON, excluding original Wan DiT shards and separate audio-condition weights.
+
+Train with `--fp8_checkpoint weights/InfiniteTalk/quant_models/infinitetalk_single_fp8.safetensors` to preserve the downloaded FP8 weights and scales without requantization. Keep the adjacent JSON. This entry point does not accept ComfyUI format. Use `--profile fp8` to download only this pair, or `--profile training-original` for the original weights required by the legacy inference commands below. VAE, CLIP, T5 and both tokenizers are included. Optional local captioning weights: `python download_weights.py --profile caption --download`. YOLO detector weights are separate; see [the training guide](lora_finetuning_guide.md).
 
 ### 🔑 Quick Inference
 

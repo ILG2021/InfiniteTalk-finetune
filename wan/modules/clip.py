@@ -519,6 +519,19 @@ def clip_xlm_roberta_vit_h_14(
     return _clip(pretrained, pretrained_name, XLMRobertaCLIP, **cfg)
 
 
+def comfy_clip_pixels(frames, size=224, crop='center'):
+    """Match ComfyUI resize/rounding: input [-1, 1], output [0, 1]."""
+    frames = frames.mul(0.5).add(0.5)
+    h, w = frames.shape[-2:]
+    if (h, w) != (size, size):
+        scale = size / min(h, w)
+        target = (round(h * scale), round(w * scale)) if crop == 'center' else (size, size)
+        frames = F.interpolate(frames, size=target, mode='bicubic', align_corners=False, antialias=True)
+        top, left = (target[0] - size) // 2, (target[1] - size) // 2
+        frames = frames[:, :, top:top+size, left:left+size]
+    return frames.mul(255).clamp(0, 255).round().div(255)
+
+
 class CLIPModel:
 
     def __init__(self, dtype, device, checkpoint_path, tokenizer_path):
@@ -545,17 +558,18 @@ class CLIPModel:
             seq_len=self.model.max_text_len - 2,
             clean='whitespace')
 
-    def visual(self, videos):
+    def visual(self, videos, comfy_crop=None):
         # preprocess
         size = (self.model.image_size,) * 2
-        videos = torch.cat([
-            F.interpolate(
-                u.transpose(0, 1),
-                size=size,
-                mode='bicubic',
-                align_corners=False) for u in videos
-        ])
-        videos = self.transforms.transforms[-1](videos.mul_(0.5).add_(0.5))
+        if comfy_crop is not None:
+            videos = torch.cat([comfy_clip_pixels(u.transpose(0, 1), size[0], comfy_crop) for u in videos])
+            videos = self.transforms.transforms[-1](videos)
+        else:
+            videos = torch.cat([
+                F.interpolate(u.transpose(0, 1), size=size, mode='bicubic',
+                              align_corners=False) for u in videos
+            ])
+            videos = self.transforms.transforms[-1](videos.mul_(0.5).add_(0.5))
 
         # forward
         with torch.cuda.amp.autocast(dtype=self.dtype):

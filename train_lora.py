@@ -35,7 +35,7 @@ from wan.modules.multitalk_model import (
     WanModel, sinusoidal_embedding_1d, rope_params, rope_apply,
     AudioProjModel, WanLayerNorm, WanRMSNorm
 )
-from wan.utils.offload_utils import ModelOffloader, _clean_memory_on_device
+from wan.utils.training_memory import prepare_model_memory, TensorLRUCache, FrozenLinear
 
 DEFAULT_TARGET_MODULES = [
     # Identity / Visual appearance pathways
@@ -78,13 +78,11 @@ class LoRALinear(nn.Module):
 
     def forward(self, x):
         # Original path (frozen) + LoRA path (trainable)
-        # x may arrive as float32 from explicit amp.autocast(float32) regions in
-        # WanAttentionBlock. quanto INT8 backward requires gO.dtype == bfloat16
-        # (the dtype weights were dequantized to). Feed bfloat16 to original_linear
-        # so its output and backward gradient stay bfloat16.
+        # Wan blocks may supply FP32 activations. The frozen branch computes
+        # in BF16 while adapters retain FP32 parameters (AMP handles matmuls).
         result = self.original_linear(x.to(torch.bfloat16))
-        lora_out = self.lora_up(self.lora_down(x)) * self.scaling
-        return result + lora_out
+        lora_out = self.lora_up(self.lora_down(x.to(self.lora_down.weight.dtype))) * self.scaling
+        return result + lora_out.to(result.dtype)
 
 
 def apply_lora_to_model(model: nn.Module, rank: int = 16, alpha: float = 16.0,
@@ -104,7 +102,7 @@ def apply_lora_to_model(model: nn.Module, rank: int = 16, alpha: float = 16.0,
 
     lora_modules = {}
     for name, module in model.named_modules():
-        if isinstance(module, nn.Linear) or type(module).__name__ == "QLinear":
+        if isinstance(module, (nn.Linear, FrozenLinear)) or type(module).__name__ == "QLinear":
             # Check if the full dotted name ends with one of the target patterns
             if any(name == target or name.endswith('.' + target) for target in target_modules):
                 lora_modules[name] = module
@@ -130,7 +128,7 @@ def apply_lora_to_model(model: nn.Module, rank: int = 16, alpha: float = 16.0,
 
 
 
-def extract_lora_state_dict(model):
+def extract_lora_state_dict(model, *, comfyui=False):
     """
     Extract LoRA weights in a format compatible with wan_lora.py.
 
@@ -141,6 +139,8 @@ def extract_lora_state_dict(model):
     state_dict = {}
     for name, module in model.named_modules():
         if isinstance(module, LoRALinear):
+            if comfyui and name.startswith('audio_proj.'):
+                name = 'multitalk_audio_proj.' + name[len('audio_proj.'):]
             prefix = f"diffusion_model.{name}"
             state_dict[f"{prefix}.lora_down.weight"] = module.lora_down.weight.data.clone().cpu()
             # Bake training-time LoRA scaling (alpha/rank) into lora_up so
@@ -171,12 +171,63 @@ def _align_audio_frames_to_latent(audio_b: torch.Tensor, f_req: int) -> torch.Te
     return torch.cat([audio_b, tail], dim=1)
 
 
+def _sample_training_timestep(device):
+    """Standard logit-normal sigma: sigmoid(N(0, 1)); keep sampling in FP32."""
+    return torch.sigmoid(torch.randn(1, device=device, dtype=torch.float32))
+
+
+def _reference_cache_key(ref_image_name, frame_num):
+    """Only metadata-backed, fixed images have a reusable identity."""
+    return (ref_image_name, frame_num) if ref_image_name else None
+
+
+def _prepared_reference_name(sample, frame_num, reference_mode):
+    """Use references sampled outside an exact, pre-captioned source window."""
+    if sample.get('reference_policy') == 'adjacent':
+        if sample.get('num_frames') != frame_num:
+            raise ValueError('Prepared clip length must equal --frame_num to keep captions aligned')
+        start, end, ref = (sample[k] for k in ('start_frame', 'end_frame', 'reference_frame'))
+        if end - start != frame_num or start <= ref < end:
+            raise ValueError('Prepared adjacent reference must be outside the source clip')
+        if not sample.get('ref_image'):
+            raise ValueError('Prepared adjacent clip is missing ref_image')
+        return sample['ref_image']
+    return sample.get('ref_image') if reference_mode == 'fixed' else None
+
+
+def _sample_adjacent_reference(start, length, total_frames, neighbor_frames):
+    """Sample outside the current window, never clamp back inside it."""
+    ranges = [(max(0, start - neighbor_frames), start - 1),
+              (start + length, min(total_frames - 1, start + length - 1 + neighbor_frames))]
+    ranges = [(lo, hi) for lo, hi in ranges if lo <= hi]
+    if not ranges:
+        raise ValueError("No adjacent reference frame; use a longer video or --reference_mode fixed with ref_image")
+    lo, hi = random.choice(ranges)
+    return random.randint(lo, hi)
+
+
+def _flow_inputs(clean, noise, t_frac, context=None):
+    """Match inference's clean prefix; only supervise generated latent frames."""
+    noisy = t_frac * noise + (1 - t_frac) * clean
+    velocity = noise - clean
+    if context is None:
+        prefix, noisy, velocity = clean[:, :1], noisy[:, 1:], velocity[:, 1:]
+    else:
+        prefix = context
+    model_input = torch.cat([prefix, noisy], dim=1)
+    target = torch.cat([torch.zeros_like(prefix), velocity], dim=1)
+    mask = torch.cat([torch.zeros_like(prefix), torch.ones_like(velocity)], dim=1)
+    return model_input, target, mask
+
+
 def _serialize_args(args: argparse.Namespace) -> Dict[str, Any]:
     """JSON-friendly hyperparameter dict for checkpoints."""
     out: Dict[str, Any] = {}
     
     # Pre-resolve defaults for clarity in checkpoint jsons
     resolved_args = vars(args).copy()
+    if resolved_args.get('quant') == 'fp8':
+        resolved_args['fp8_weight_scaling'] = 'checkpoint_preserved' if resolved_args.get('fp8_checkpoint') else 'per_output_channel_v1'
     if not resolved_args.get("tensorboard_dir"):
         resolved_args["tensorboard_dir"] = "output/my_lora/tensorboard"
 
@@ -295,6 +346,9 @@ def save_training_checkpoint(
         lora_sd = extract_lora_state_dict(model)
         inference_lora_path = os.path.join(ckpt_dir, "lora_for_inference.safetensors")
         save_file(lora_sd, inference_lora_path)
+        comfy_path = os.path.join(ckpt_dir, 'lora_for_comfyui.safetensors')
+        save_file(extract_lora_state_dict(model, comfyui=True), comfy_path,
+                  metadata={'format': 'WanVideoWrapper', 'scaling': 'alpha_over_rank_baked_into_up'})
 
     # 4) Latest pointer (Windows-friendly: a tiny json file in output root)
     if write_latest:
@@ -358,16 +412,26 @@ def _trim_optimizer_state_dict(
     return {"state": new_state, "param_groups": new_groups}
 
 
+def _validate_resume_configuration(saved, current):
+    if current is None:
+        return
+    for key in ('lora_rank', 'lora_alpha', 'train_audio'):
+        if key in saved and saved[key] != getattr(current, key):
+            raise ValueError(f'Cannot resume with changed {key}: checkpoint={saved[key]}, current={getattr(current, key)}')
+
+
 def load_training_checkpoint(
         path: str,
         model: nn.Module,
         optimizer: torch.optim.Optimizer,
         scheduler: Any,
         strict: bool = True,
+        expected_args=None,
 ) -> Tuple[int, int, Dict[str, Any]]:
     """Loads adapter weights + optimizer/scheduler/scaler/RNG. Supports new checkpoint dirs and legacy .pt."""
     if _is_legacy_training_pt(path):
         ckpt = torch.load(path, map_location='cpu', weights_only=False)
+        _validate_resume_configuration(ckpt.get('args', {}), expected_args)
         if ckpt.get('format_version') != 1:
             logging.warning(f"Checkpoint format_version={ckpt.get('format_version')!r}; expected 1")
 
@@ -381,6 +445,8 @@ def load_training_checkpoint(
                 logging.warning(f"Skipping ckpt param not in model: {name}")
                 continue
             p = name_to_param[name]
+            if tuple(p.shape) != tuple(tensor.shape):
+                raise ValueError(f'Adapter shape mismatch: {name}')
             p.data.copy_(tensor.to(p.device, dtype=p.dtype))
             loaded += 1
         model_keys = set(name_to_param.keys())
@@ -414,6 +480,7 @@ def load_training_checkpoint(
     if not os.path.isfile(trainer_state_path):
         raise FileNotFoundError(f"trainer_state.json not found in checkpoint dir: {ckpt_dir}")
     trainer_state = _load_json(trainer_state_path)
+    _validate_resume_configuration(trainer_state.get('args', {}), expected_args)
     if int(trainer_state.get("format_version", 0)) not in (2, 3):
         logging.warning(f"Checkpoint format_version={trainer_state.get('format_version')!r}; expected 3")
 
@@ -433,6 +500,8 @@ def load_training_checkpoint(
                 logging.warning(f"Skipping adapter param not in model: {name}")
                 continue
             p = name_to_param[name]
+            if tuple(p.shape) != tuple(f.get_slice(name).get_shape()):
+                raise ValueError(f'Adapter shape mismatch: {name}')
             p.data.copy_(f.get_tensor(name).to(p.device, dtype=p.dtype))
             loaded += 1
 
@@ -450,7 +519,7 @@ def load_training_checkpoint(
 
     # 2) Training states
     saved_opt_sd = torch.load(os.path.join(ckpt_dir, "optimizer.pt"), map_location="cpu", weights_only=False)
-    opt_sd = _trim_optimizer_state_dict(saved_opt_sd, optimizer)
+    opt_sd = saved_opt_sd if strict else _trim_optimizer_state_dict(saved_opt_sd, optimizer)
     optimizer.load_state_dict(opt_sd)
     scheduler.load_state_dict(torch.load(os.path.join(ckpt_dir, "scheduler.pt"), map_location="cpu", weights_only=False))
     _set_rng_state(torch.load(os.path.join(ckpt_dir, "rng_state.pth"), map_location="cpu", weights_only=False))
@@ -480,14 +549,16 @@ class InfiniteTalkDataset(Dataset):
     def __init__(
             self,
             data_dir,
-            frame_num=33,
+            frame_num=81,
             audio_window=5,
             ref_neighbor_frames: int = 25,
+            reference_mode: str = 'adjacent',
     ):
         self.data_dir = data_dir
         self.frame_num = frame_num
         self.audio_window = audio_window
         self.ref_neighbor_frames = ref_neighbor_frames
+        self.reference_mode = reference_mode
 
         # Load metadata
         metadata_path = os.path.join(data_dir, 'metadata.json')
@@ -495,6 +566,8 @@ class InfiniteTalkDataset(Dataset):
             self.metadata = json.load(f)
 
         self.samples = self.metadata['samples']
+        if not self.samples:
+            raise ValueError('Training dataset has no samples')
         logging.info(f"Loaded {len(self.samples)} training samples from {data_dir}")
 
     def __len__(self):
@@ -524,59 +597,63 @@ class InfiniteTalkDataset(Dataset):
 
     def __getitem__(self, idx):
         sample = self.samples[idx]
+        ref_image_name = _prepared_reference_name(sample, self.frame_num, self.reference_mode)
         video_path = os.path.join(self.data_dir, 'videos', sample['video'])
         audio_emb_path = os.path.join(self.data_dir, 'audio_embs', sample['audio_emb'])
-        prompt = sample.get('prompt', 'A news anchor is broadcasting.')
+        prompt = sample.get('prompt')
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ValueError(f"Missing caption for {sample['video']}")
 
         # Load pre-computed audio embedding: [total_frames, 12, 768]
         full_audio_emb = torch.load(audio_emb_path, map_location='cpu', weights_only=True)
+        if (full_audio_emb.ndim != 3 or tuple(full_audio_emb.shape[1:]) != (12, 768)
+                or not torch.isfinite(full_audio_emb).all()):
+            raise ValueError(f'Invalid audio embedding shape/values: {audio_emb_path}')
         total_audio_frames = full_audio_emb.shape[0]
 
         # We need self.frame_num frames for the entire training segment.
         # To perfectly mirror inference sliding window size, the total window is fixed.
         # For continuation mode, context (9 frames) and target (remaining frames) share this window.
-        context_frames = 9
         needed_frames = self.frame_num
-        max_start = max(0, total_audio_frames - needed_frames - 5)
-        start_frame = random.randint(0, max_start) if max_start > 0 else 0
 
         # Load video frames (up to needed_frames)
         # Also get total video frame count for correct reference frame boundary clamping.
         from decord import VideoReader, cpu as decord_cpu
         _vr = VideoReader(video_path, ctx=decord_cpu(0))
         total_video_frames = len(_vr)
+        if abs(_vr.get_avg_fps() - 25) > 0.01:
+            raise ValueError(f'{video_path}: expected 25 fps; rerun preprocessing')
         del _vr
+        usable_frames = min(total_audio_frames, total_video_frames)
+        if sample.get('reference_policy') == 'adjacent' and (
+                total_video_frames != self.frame_num or total_audio_frames != self.frame_num):
+            raise ValueError('Prepared video/audio length does not match its caption window')
+        if usable_frames < needed_frames:
+            raise ValueError(f"{sample['video']}: need {needed_frames} aligned frames, got {usable_frames}")
+        start_frame = random.randint(0, usable_frames - needed_frames)
         video_full = self._load_video_frames(video_path, start_frame, needed_frames)  # T_full, C, H, W
 
         # Reference frame for identity
-        ref_image_name = sample.get('ref_image', None)
+        if self.reference_mode == 'fixed' and not ref_image_name:
+            raise ValueError(f"{sample['video']}: --reference_mode fixed requires ref_image")
         if ref_image_name:
-            # Use fixed reference image from metadata (grouped by expression)
+            # Preselected adjacent source frame, or an explicitly fixed reference.
             from PIL import Image as PILImage
             ref_img_path = os.path.join(self.data_dir, 'ref_images', ref_image_name)
             ref_pil = PILImage.open(ref_img_path).convert('RGB')
             ref_frame = torch.from_numpy(np.array(ref_pil)).permute(2, 0, 1).float() / 255.0
             ref_frame = (ref_frame - 0.5) * 2  # C, H, W
         else:
-            # Fallback: sample from a temporally adjacent region (paper M3)
-            seg_start = start_frame
-            seg_end = start_frame + needed_frames - 1
-            nb = max(0, int(self.ref_neighbor_frames))
-            left_lo = max(0, seg_start - nb)
-            left_hi = max(0, seg_start - 1)
-            right_lo = min(total_video_frames - 1, seg_end + 1)
-            right_hi = min(total_video_frames - 1, seg_end + nb)
-            candidates: List[int] = []
-            if left_lo <= left_hi:
-                candidates.append(random.randint(left_lo, left_hi))
-            if right_lo <= right_hi:
-                candidates.append(random.randint(right_lo, right_hi))
-            if candidates:
-                ref_offset = random.choice(candidates)
-            else:
-                ref_offset = random.randint(0, total_video_frames - 1)
+            # Default: sample outside the current window from a nearby region (M3).
+            ref_offset = _sample_adjacent_reference(
+                start_frame, needed_frames, total_video_frames, self.ref_neighbor_frames)
             ref_video = self._load_video_frames(video_path, ref_offset, 1)
             ref_frame = ref_video.squeeze(0)  # C, H, W
+
+        if tuple(ref_frame.shape) != tuple(video_full.shape[1:]):
+            raise ValueError(f'{video_path}: reference and video must share the same crop/resolution')
+        if any(size % 16 for size in video_full.shape[-2:]):
+            raise ValueError(f'{video_path}: height and width must be divisible by 16')
 
         # Extract audio window for the FULL needed frames
         audio_window_indices = (torch.arange(self.audio_window) - self.audio_window // 2)
@@ -591,6 +668,7 @@ class InfiniteTalkDataset(Dataset):
             'audio_emb_full': full_audio_emb_segment,  # needed_frames, window, 12, 768
             'prompt': prompt,
             'ref_image_name': ref_image_name or '',  # Used as cache key for CLIP/text embeddings
+            'latent_cache_key': f"{sample['video']}:{start_frame}:{needed_frames}",
         }
 
 
@@ -616,8 +694,33 @@ def train(args):
     )
     if not (0.0 <= args.first_clip_prob <= 1.0):
         raise ValueError(f"--first_clip_prob must be in [0, 1], got {args.first_clip_prob}")
-    if (args.frame_num - 1) % 4 != 0:
-        raise ValueError(f"--frame_num must satisfy 4n+1, got {args.frame_num}")
+    if args.frame_num <= 9 or (args.frame_num - 1) % 4 != 0:
+        raise ValueError(f"--frame_num must be greater than 9 and satisfy 4n+1, got {args.frame_num}")
+    if args.ref_neighbor_frames < 1:
+        raise ValueError("--ref_neighbor_frames must be positive")
+    if args.lora_rank < 1 or not math.isfinite(args.lora_alpha) or args.lora_alpha <= 0:
+        raise ValueError('LoRA rank and alpha must be positive and finite')
+    for key in ('lr', 'audio_lr'):
+        value = getattr(args, key)
+        if value is not None and (not math.isfinite(value) or value <= 0):
+            raise ValueError(f'{key} must be positive and finite')
+    if args.blocks_to_swap < 0 or not math.isfinite(args.cpu_cache_gb) or args.cpu_cache_gb < 0:
+        raise ValueError('Offloaded block count and CPU cache budget must be non-negative')
+    if args.log_every < 1 or args.max_steps < 1 or args.num_workers < 0:
+        raise ValueError('log_every/max_steps must be positive and num_workers non-negative')
+    if args.activation_offload and not args.gradient_checkpointing:
+        raise ValueError('--activation_offload requires --gradient_checkpointing')
+    for name in ('cfg_drop_clip_prob', 'cfg_drop_ref_prob'):
+        if not 0 <= getattr(args, name) <= 1:
+            raise ValueError(f"--{name} must be in [0, 1]")
+    if args.quant == 'int8':
+        raise ValueError("INT8 training is not implemented. Use --quant fp8 or omit --quant for BF16.")
+    if args.fp8_checkpoint:
+        args.quant = 'fp8'
+        if args.infinitetalk_dir:
+            raise ValueError('--fp8_checkpoint already includes InfiniteTalk; omit --infinitetalk_dir')
+    elif not args.infinitetalk_dir:
+        raise ValueError('Provide --fp8_checkpoint or original --infinitetalk_dir')
     if args.cfg_drop_text_prob < 0 or args.cfg_drop_audio_prob < 0 or args.cfg_drop_both_prob < 0:
         raise ValueError("CFG dropout probabilities must be non-negative")
     if args.cfg_drop_text_prob + args.cfg_drop_audio_prob + args.cfg_drop_both_prob > 1.0:
@@ -627,6 +730,11 @@ def train(args):
 
     device = torch.device(f'cuda:{args.device_id}')
     torch.cuda.set_device(device)
+    from wan.modules import attention as attention_module
+    attention_module.TRAINING_ATTENTION_BACKEND = args.attention_backend
+    logging.info('GPU %s: %.1f GiB dedicated VRAM; CPU offload blocks=%d, activation offload=%s',
+                 torch.cuda.get_device_name(device), torch.cuda.get_device_properties(device).total_memory / 2**30,
+                 args.blocks_to_swap, args.activation_offload)
 
     # ---- Load model ----
     logging.info("Loading InfiniteTalk model...")
@@ -645,72 +753,24 @@ def train(args):
         lora_dir=None,
         lora_scales=None,
         quant=None,
+        init_on_cpu=True,
+        auxiliary_device='cpu',
+        training_fp8_path=args.fp8_checkpoint,
         dit_path=None,
         infinitetalk_dir=args.infinitetalk_dir,
     )
 
     model = pipeline.model
-    # Offload CLIP/T5 to CPU to save VRAM for the DiT, but keep VAE on GPU (it's small but compute-heavy)
+    # Auxiliary models start on CPU to avoid a transient startup GPU peak.
     vae = pipeline.vae
-    vae.to(device)
+    vae.to('cpu' if args.vae_cpu_offload else device)
     clip_model = pipeline.clip
     clip_model.model.to('cpu').float()  # float16 not supported on CPU, cast to float32
     text_encoder = pipeline.text_encoder
     text_encoder.model.to('cpu')
-    logging.info("Offloaded vae / clip / text_encoder to CPU")
+    logging.info('CLIP/T5 on CPU; VAE is %s', 'loaded on demand' if args.vae_cpu_offload else 'GPU resident')
 
-    # ---- Quantize frozen base model to reduce VRAM ----
-    if args.quant == 'fp8':
-        logging.info("Quantizing frozen base model to FP8 (float8_e4m3fn) + monkey patch a la musubi-tuner...")
-        max_val = torch.finfo(torch.float8_e4m3fn).max
-        min_val = -max_val
-        quantized_count = 0
-        from torch.nn import functional as F
-        
-        # We need to wrap the forward method for monkey patching FP8
-        def make_fp8_forward(module):
-            def fp8_forward(x):
-                # Dequantize weight dynamically for the forward pass, using the same dtype as input
-                dequantized_weight = (module.weight.to(x.dtype) * module.scale_weight.to(x.dtype))
-                bias = module.bias.to(x.dtype) if module.bias is not None else None
-                return F.linear(x, dequantized_weight, bias)
-            return fp8_forward
-            
-        for name, module in model.named_modules():
-            if isinstance(module, torch.nn.Linear):
-                # We skip layers that will be LoRA adapted if they need to be strictly BF16? 
-                # Actually, LoRA replaces Linear with LoRALinear which adds adapters to this base layer. 
-                # The base layer stays frozen. So quantizing it is perfect!
-                weight_data = module.weight.data.float()
-                
-                # Per-tensor quantization
-                tensor_max = torch.max(torch.abs(weight_data).view(-1))
-                scale = tensor_max / max_val
-                scale = torch.clamp(scale, min=1e-8)
-                
-                quantized_weight = (weight_data / scale).clamp_(min=min_val, max=max_val).to(torch.float8_e4m3fn)
-                
-                # Replace module weights
-                module.weight = torch.nn.Parameter(quantized_weight, requires_grad=False)
-                module.register_buffer("scale_weight", scale.to(torch.bfloat16))
-                
-                # Patch forward
-                module.forward = make_fp8_forward(module)
-                quantized_count += 1
-                
-                if module.bias is not None:
-                    module.bias.data = module.bias.data.to(torch.bfloat16)
-                    
-        logging.info(f"FP8 quantization applied to {quantized_count} linear layers. Memory: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
-    elif args.quant == 'int8':
-        # Default to bitsandbytes for int8 if requested instead of quanto
-        import bitsandbytes as bnb
-        logging.info("Int8 not directly supported via native patch here, defaulting to BF16 or try `fp8`")
-        
-    torch.cuda.empty_cache()
-    gc.collect()
-
-    # ---- Freeze everything (re-verify after quantization) ----
+    # ---- Freeze before adding adapters; quantize frozen layers on CPU below ----
     for param in model.parameters():
         param.requires_grad = False
 
@@ -726,12 +786,14 @@ def train(args):
 
     torch.cuda.empty_cache()
     gc.collect()
-    model = model.to(device)
+    memory_plan = prepare_model_memory(
+        model, device, fp8=args.quant == 'fp8' and not args.fp8_checkpoint, blocks_to_offload=args.blocks_to_swap,
+        pin_memory=args.offload_pin_memory)
+    logging.info('Memory placement: %s; GPU allocated %.2f GiB', memory_plan,
+                 torch.cuda.memory_allocated(device) / 2**30)
     model.disable_teacache()
-    
-    if hasattr(args, "blocks_to_swap") and args.blocks_to_swap > 0:
-        model.enable_block_swap(args.blocks_to_swap, device, supports_backward=True)
-        model.prepare_block_swap_before_forward()
+    model.activation_offload = args.activation_offload
+    model.activation_offload_pin_memory = args.offload_pin_memory
     
     # ---- Collect trainable parameters (keep in float32 for training stability) ----
     visual_params = []
@@ -802,7 +864,8 @@ def train(args):
             model,
             optimizer,
             scheduler,
-            strict=False,
+            strict=True,
+            expected_args=args,
         )
         os.makedirs(args.output_dir, exist_ok=True)
         with open(os.path.join(args.output_dir, "resume_meta.json"), "w", encoding="utf-8") as f:
@@ -814,7 +877,7 @@ def train(args):
                         f"Arg {k!r} differs from checkpoint: current={getattr(args, k)!r} saved={saved_args.get(k)!r}"
                     )
         # [NEW] Detect if user explicitly requested to override the resumed learning rate
-        _audio_lr_cli = getattr(args, "audio_lr", args.lr)
+        _audio_lr_cli = audio_lr
         
         if getattr(args, "override_lr", False):
             if len(optimizer.param_groups) > 0:
@@ -839,6 +902,7 @@ def train(args):
         frame_num=args.frame_num,
         audio_window=cfg.get('audio_window', 5) if hasattr(cfg, 'get') else 5,
         ref_neighbor_frames=args.ref_neighbor_frames,
+        reference_mode=args.reference_mode,
     )
     dataloader = DataLoader(
         dataset,
@@ -853,43 +917,8 @@ def train(args):
     num_timesteps = 1000
     vae_stride = (4, 8, 8)
     patch_size = (1, 2, 2)
-    # Fixed shift=11.0 to match inference behavior regardless of resolution
-    shift = 11.0
-    logging.info(f"Using fixed shift={shift}")
-
-    # ---- Timestep bias sampler (AI Toolkit style) ----
-    # high_noise : current behavior, shift=11, skews >87% of steps toward t>917 (learns structure/motion)
-    # balanced   : logit-normal N(0,1)|sigmoid, centers sampling at t≈500 (learns structure + fine detail)
-    # low_noise  : logit-normal N(-2,1)|sigmoid, concentrates at t<300 (learns fine detail / identity)
-    def sample_training_timestep(bias: str) -> torch.Tensor:
-        """Returns a scalar fractional timestep t_frac in [0,1] according to the chosen bias strategy."""
-        if bias == 'high_noise':
-            # Original flow-matching shift formula — heavily skewed toward high noise
-            t = torch.rand(1, device=device, dtype=torch.float32)
-            t = shift * t / (1 + (shift - 1) * t)
-        elif bias == 'balanced':
-            # Logit-normal distribution: sigmoid(N(0, σ=1.6)) → concentrates around t=0.5
-            # Covers the full denoising spectrum rather than camping at t>0.9
-            u = torch.randn(1, device=device, dtype=torch.float32) * 1.6
-            t = torch.sigmoid(u)
-        elif bias == 'low_noise':
-            # Logit-normal shifted negative: sigmoid(N(-2.5, σ=1.2)) → concentrates at t<0.3
-            # Forces the model to learn fine facial details and skin texture
-            u = torch.randn(1, device=device, dtype=torch.float32) * 1.2 - 2.5
-            t = torch.sigmoid(u)
-        else:
-            raise ValueError(f"Unknown timestep_bias: {bias!r}. Choose: high_noise | balanced | low_noise")
-        return t  # shape [1], dtype float32, range [0,1]
-
-    initial_bias = getattr(args, 'timestep_bias', 'high_noise')
-    bias_switch_step = getattr(args, 'bias_switch_step', 0)
-    if bias_switch_step > 0:
-        logging.info(
-            f"Timestep bias schedule: '{initial_bias}' for steps 1-{bias_switch_step}, "
-            f"then 'balanced' from step {bias_switch_step+1} onwards."
-        )
-    else:
-        logging.info(f"Timestep bias: '{initial_bias}' (fixed, no auto-switch)")
+    # One fixed logit-normal distribution throughout training, without schedule shift.
+    logging.info("Training timesteps: logit-normal, mean=0, std=1, no shift or stage switching")
 
     # ---- Training ----
     logging.info(f"Starting LoRA training for {args.max_steps} steps...")
@@ -902,12 +931,12 @@ def train(args):
             module.train()
             
     # ---- Cache CLIP visual and text embeddings ----
-    # Since ref_image is fixed per expression group and prompt is fixed,
-    # we can pre-compute these once and reuse them every step.
-    # Dropout is handled by zeroing the cached result at runtime.
-    clip_cache: Dict[str, torch.Tensor] = {}   # ref_image_name → clip_fea
-    text_cache: Dict[str, List[torch.Tensor]] = {}  # prompt_str → context_list
-    y_cond_cache: Dict[str, torch.Tensor] = {}  # ref_image_name → y_cond (ref frame VAE latent + mask, CPU)
+    # Cache fixed metadata images only; adjacent and first-clip references vary.
+    cache_budget = int(args.cpu_cache_gb * 2**30 / 4)
+    clip_cache = TensorLRUCache(cache_budget)
+    text_cache = TensorLRUCache(cache_budget)
+    y_cond_cache = TensorLRUCache(cache_budget)
+    latent_cache = TensorLRUCache(cache_budget)
 
     def get_clip_features(ref_frame_tensor: torch.Tensor, ref_image_name: str = None) -> torch.Tensor:
         """Get CLIP visual features, using cache if available."""
@@ -916,7 +945,7 @@ def train(args):
         # Compute and cache
         with torch.no_grad():
             ref_for_clip_cpu = ref_frame_tensor.unsqueeze(0).unsqueeze(2).to('cpu')
-            clip_fea = clip_model.visual(ref_for_clip_cpu).to(device).to(torch.bfloat16)
+            clip_fea = clip_model.visual(ref_for_clip_cpu, comfy_crop=args.clip_crop).to(device).to(torch.bfloat16)
         if ref_image_name:
             clip_cache[ref_image_name] = clip_fea.cpu()  # Cache on CPU to save VRAM
         return clip_fea
@@ -931,6 +960,24 @@ def train(args):
         text_cache[prompt_str] = [t.cpu() for t in context_list]  # Cache on CPU
         return context_list
 
+    def encode_video(video, key):
+        if key in latent_cache:
+            return latent_cache[key].to(device)
+        vae.to(device)
+        latent = vae.encode([video])[0]
+        latent_cache[key] = latent.detach().cpu()
+        return latent
+
+    def encode_reference(ref_frame):
+        # Function scope releases large padded pixel tensors before DiT runs.
+        vae.to(device)
+        padded = torch.zeros(3, args.frame_num, *ref_frame.shape[1:], device=device)
+        padded[:, 0] = ref_frame
+        latent = vae.encode([padded])[0]
+        mask = torch.zeros(4, latent.shape[1], *latent.shape[2:], device=device)
+        mask[:, 0] = 1
+        return torch.cat([mask, latent], dim=0).to(torch.bfloat16)
+
     progress_bar = tqdm(total=args.max_steps, initial=current_step, desc="Training steps")
 
     while current_step < args.max_steps:
@@ -938,6 +985,9 @@ def train(args):
         for batch in dataloader:
             if current_step >= args.max_steps:
                 break
+
+            optimizer.zero_grad(set_to_none=True)
+            torch.cuda.reset_peak_memory_stats(device)
 
             video_full = batch['video_full'].to(device)[0]  # C, needed_frames, H, W
             ref_frame = batch['ref_frame'].to(device)[0]  # C, H, W
@@ -955,19 +1005,19 @@ def train(args):
             # Lower first-clip probability so continuation training dominates.
             is_first_clip = random.random() < args.first_clip_prob
             is_continuation = not is_first_clip
+            if is_first_clip:
+                # Inference clamps the first latent to the initial reference image.
+                ref_frame = video_full[:, 0]
             target_frames = args.frame_num
 
             with torch.no_grad():
                 if not is_continuation:
-                    # First clip: no context
+                    # First clip: no previous chunk, but the initial latent is clamped below.
                     with torch.no_grad():
-                        video_target_device = video_full[:, :target_frames].to(device)
-                        ref_frame_device = ref_frame.unsqueeze(1).to(device)
-                        
-                        x_1 = vae.encode([video_target_device])[0]  # C_lat, T_target, lat_h, lat_w
+                        x_1 = encode_video(video_full, batch['latent_cache_key'][0])
                     x_context = None
-                    total_latents = x_1.shape[1]  # Must match x_t exactly. ref_latent sits at index 0 of this timeline.
-                    # The reference frame (x_0) is purely for y_cond spatial layout. 
+                    total_latents = x_1.shape[1]
+                    # The same initial frame supplies CLIP, VAE conditioning and the clean prefix.
                     # The audio track matches 1:1 with the pixel frames of the target video.
                     audio_input = audio_emb_full[:target_frames].unsqueeze(0).to(torch.bfloat16)
                 else:
@@ -978,8 +1028,7 @@ def train(args):
                     with torch.no_grad():
                         # Encode all frames together to preserve temporal receptive field and avoid boundary artifacts
                         # from the VAE's 3D convolutions at the cut point.
-                        video_combined_device = video_full[:, :args.frame_num].to(device)
-                        x_combined = vae.encode([video_combined_device])[0]  # C_lat, T_total, lat_h, lat_w
+                        x_combined = encode_video(video_full, batch['latent_cache_key'][0])
                         
                         # In pixel space, context_frames is 9. In the temporal latent space with stride 4:
                         # latent_length = int(1 + (pixel_length - 1) // 4)
@@ -1002,35 +1051,20 @@ def train(args):
                 ref_image_name = ref_image_name[0]
             if not ref_image_name:  # empty string fallback
                 ref_image_name = None
+            if is_first_clip:
+                ref_image_name = None  # This frame changes with the sampled window.
 
             with torch.no_grad():
-                # y_cond only depends on (ref_image, frame_num) — both are fixed during training.
-                # We cache it on CPU to avoid re-running a large VAE encode every step.
-                _y_cond_key = f"{ref_image_name}_{args.frame_num}"
-                if _y_cond_key in y_cond_cache:
+                _y_cond_key = _reference_cache_key(ref_image_name, args.frame_num)
+                if _y_cond_key is not None and _y_cond_key in y_cond_cache:
                     y_cond = y_cond_cache[_y_cond_key].to(device)
                 else:
-                    with torch.no_grad():
-                        ref_frame_batch = ref_frame.unsqueeze(0).unsqueeze(2).to(device)  # 1, C_img, 1, H, W
-                        pixel_frame_num = args.frame_num
-                        video_frames_pad = torch.zeros(
-                            1, 3, pixel_frame_num - 1, ref_frame.shape[1], ref_frame.shape[2], device=device
-                        )
-                        padding_frames_pixels = torch.cat([ref_frame_batch, video_frames_pad], dim=2)
-                        y = vae.encode(padding_frames_pixels)
-                        y_latent = torch.stack(y)[0]  # C_lat, T_lat, lat_h, lat_w
+                    y_cond = encode_reference(ref_frame)
+                    if _y_cond_key is not None:
+                        y_cond_cache[_y_cond_key] = y_cond.cpu()
 
-                    # Construct mask exactly matching inference logic
-                    msk_inf = torch.ones(1, pixel_frame_num, lat_h, lat_w, device=device)
-                    msk_inf[:, 1:] = 0
-                    msk_inf = torch.concat([
-                        torch.repeat_interleave(msk_inf[:, 0:1], repeats=4, dim=1), msk_inf[:, 1:]
-                    ], dim=1)
-                    msk_inf = msk_inf.view(1, msk_inf.shape[1] // 4, 4, lat_h, lat_w)
-                    msk = msk_inf.transpose(1, 2)[0]  # 4, T_lat, lat_h, lat_w
-                    y_cond = torch.cat([msk, y_latent], dim=0).to(torch.bfloat16)
-                    y_cond_cache[_y_cond_key] = y_cond.cpu()  # Cache on CPU
-                    logging.info(f"  y_cond cached for key: {_y_cond_key}")
+            if args.vae_cpu_offload:
+                vae.to('cpu')
 
             # ---- CLIP and Text (Shared) ----
             # ---- CFG dropout (train-time) ----
@@ -1073,37 +1107,19 @@ def train(args):
 
                 human_mask = torch.ones([lat_h, lat_w], device=device).unsqueeze(0).repeat(3, 1, 1).float()
 
-            # Drop reference frame VAE condition: replace with noise latent
+            del video_full, ref_frame, audio_emb_full
+
+            # Explicit absent-reference condition: no indicated frames, zero latents.
+            # Opt-in experiment; disabled by default to preserve inference conditioning.
             if drop_ref:
-                y_cond = torch.randn_like(y_cond)
+                y_cond = torch.zeros_like(y_cond)
 
             # ---- Flow matching interpolation ----
             x_0 = torch.randn_like(x_1)
-            # Determine active bias (auto-switch from high_noise → balanced after bias_switch_step)
-            if bias_switch_step > 0 and current_step >= bias_switch_step:
-                active_bias = 'balanced'
-            else:
-                active_bias = initial_bias
-            t_frac = sample_training_timestep(active_bias).to(dtype=x_1.dtype)
-            t_shifted = t_frac * num_timesteps
+            t_frac = _sample_training_timestep(device)
+            timestep = t_frac * num_timesteps
 
-            x_t = cast(torch.Tensor, t_frac.view(1, 1, 1, 1) * x_0 + (1 - t_frac).view(1, 1, 1, 1) * x_1)
-            # Velocity target = noise - data (same convention as musubi-tuner and inference's -noise_pred).
-            target = x_0 - x_1
-
-            if is_continuation:
-                # Eq.(3): z1 = concat(x_context, x_t)
-                # Note: although wan/multitalk.py contains an "add_noise" injection for motion frames,
-                # it is immediately overwritten by a clean-prefix assignment in the same step.
-                # We follow the effective open-source inference behavior here.
-                assert x_context is not None
-                x_input = torch.cat([x_context, x_t], dim=1)
-                target_full = torch.cat([torch.zeros_like(x_context), target], dim=1)
-                loss_mask = torch.cat([torch.zeros_like(x_context), torch.ones_like(target)], dim=1)
-            else:
-                x_input = x_t
-                target_full = target
-                loss_mask = torch.ones_like(target_full)
+            x_input, target_full, loss_mask = _flow_inputs(x_1, x_0, t_frac, x_context)
 
             # Align audio frame count to latent temporal length (WanModel rearrange needs (F-1) % vae_scale == 0).
             vae_t = int(getattr(model, "vae_scale", 4))
@@ -1124,36 +1140,35 @@ def train(args):
                     assert t_lat == x_context.shape[1] + x_1.shape[1]
 
             # ---- Forward pass ----
-            optimizer.zero_grad(set_to_none=True)
             T_total = x_input.shape[1]
             # Compute seq_len to match exactly how WanModel patchifies the latent:
             # patchify does (lat_h // p) * (lat_w // p) per frame, NOT lat_h * lat_w // p^2.
             # These differ when lat_h or lat_w is not divisible by p (off-by-one via floor).
             max_seq_len = T_total * (lat_h // patch_size[1]) * (lat_w // patch_size[2])
 
-            # Gradient checkpointing requires at least one input with requires_grad=True
-            # for each checkpointed segment to properly recompute activations (musubi-tuner convention).
-            if args.gradient_checkpointing:
-                x_input.requires_grad_(True)
-                for t_ctx in context_list:
-                    t_ctx.requires_grad_(True)
-                y_cond.requires_grad_(True)
-                clip_fea.requires_grad_(True)
+            # Non-reentrant checkpointing tracks adapter gradients even when
+            # pixel/text conditions are frozen; no extra condition gradients.
 
             with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=args.use_amp):
                 pred = model(
-                    x=[x_input], t=t_shifted, context=context_list, seq_len=max_seq_len,
+                    x=[x_input], t=timestep, context=context_list, seq_len=max_seq_len,
                     clip_fea=clip_fea, y=[y_cond], audio=audio_input, ref_target_masks=human_mask,
                 )[0]
                 loss = F.mse_loss(pred.float() * loss_mask, target_full.float() * loss_mask) / loss_mask.mean()
+            if not torch.isfinite(loss):
+                raise FloatingPointError(f'Non-finite loss at step {current_step}; optimizer was not updated')
 
             # ---- Backward ----
             loss.backward()
             grad_norm_val: Optional[torch.Tensor] = None
             if args.max_grad_norm > 0:
-                grad_norm_val = torch.nn.utils.clip_grad_norm_(visual_params + audio_params, args.max_grad_norm)
+                grad_norm_val = torch.nn.utils.clip_grad_norm_(visual_params + audio_params, args.max_grad_norm,
+                                                               error_if_nonfinite=True)
+            elif any(p.grad is not None and not torch.isfinite(p.grad).all() for p in visual_params + audio_params):
+                raise FloatingPointError('Non-finite gradients; optimizer was not updated')
 
             optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
             scheduler.step()
 
             current_step = cast(int, current_step + 1)
@@ -1175,15 +1190,21 @@ def train(args):
                 writer.add_scalar("train/cfg_drop_clip", 1.0 if drop_clip else 0.0, current_step)
                 writer.add_scalar("train/cfg_drop_ref", 1.0 if drop_ref else 0.0, current_step)
                 writer.add_scalar("train/timestep_frac", float(t_frac.item()), current_step)
-                writer.add_scalar("train/timestep_bias_high_noise", 1.0 if active_bias == 'high_noise' else 0.0, current_step)
                 if grad_norm_val is not None:
                     writer.add_scalar("train/grad_norm", float(grad_norm_val), current_step)
                 if current_step % args.log_every == 0:
                     writer.flush()
 
             # ---- Logging ----
-            if current_step % args.log_every == 0:
-                pass # logging to stdout is handled gracefully by tqdm now
+            if current_step == 1 or current_step % args.log_every == 0:
+                peak = torch.cuda.max_memory_allocated(device) / 2**30
+                reserved = torch.cuda.max_memory_reserved(device) / 2**30
+                cache_gb = sum(c.bytes for c in (clip_cache, text_cache, y_cond_cache, latent_cache)) / 2**30
+                logging.info('Memory: peak allocated %.2f GiB, peak reserved %.2f GiB; CPU tensor cache %.2f GiB',
+                             peak, reserved, cache_gb)
+                if writer is not None:
+                    writer.add_scalar('memory/peak_allocated_gib', peak, current_step)
+                    writer.add_scalar('memory/peak_reserved_gib', reserved, current_step)
 
             # ---- Save checkpoint ----
             if args.save_every > 0 and current_step % args.save_every == 0:
@@ -1203,10 +1224,10 @@ def train(args):
                     logging.info(f"Saved inference LoRA: {inference_lora_path}")
 
             # Cleanup
-            del x_1, x_0, x_t, x_input, target, target_full, loss_mask, pred, loss
+            del x_1, x_0, x_input, target_full, loss_mask, pred, loss
             if is_continuation and x_context is not None:
-                del x_context
-            torch.cuda.empty_cache()
+                del x_context, x_combined
+            del y_cond, clip_fea, context_list, audio_input, human_mask
 
     progress_bar.close()
     
@@ -1236,14 +1257,18 @@ def train(args):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="InfiniteTalk LoRA Fine-tuning (Single Person)")
+    parser.add_argument('--clip_crop', choices=['center', 'disabled'], default='center',
+                        help='Match WanVideoWrapper CLIP preprocessing (workflow default: center)')
 
     # Model paths
     parser.add_argument("--ckpt_dir", type=str, required=True,
                         help="Path to Wan2.1-I2V-14B checkpoint directory")
-    parser.add_argument("--infinitetalk_dir", type=str, required=True,
-                        help="Path to infinitetalk.safetensors")
+    parser.add_argument("--infinitetalk_dir", type=str, default=None,
+                        help="Original audio weights, only for loading unquantized Wan shards")
+    parser.add_argument('--fp8_checkpoint', type=str, default=None,
+                        help='Official merged single FP8 .safetensors; matching .json must be alongside it')
     parser.add_argument("--quant", type=str, default=None, choices=['int8', 'fp8', None],
-                        help="Quantization for base model. Recommended: int8 for 5090")
+                        help="Base weights: fp8 or omit for BF16. int8 is rejected (not implemented).")
 
     # Data
     parser.add_argument("--data_dir", type=str, required=True,
@@ -1263,8 +1288,10 @@ def parse_args():
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--max_steps", type=int, default=1000)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
-    parser.add_argument("--frame_num", type=int, default=33,
-                        help="Frames per training clip (4n+1). Use 33 for 5090.")
+    parser.add_argument("--frame_num", type=int, default=81,
+                        help="Frames per training clip (4n+1, >9). Default 81 matches prepared caption windows.")
+    parser.add_argument("--reference_mode", choices=['adjacent', 'fixed'], default='adjacent',
+                        help="adjacent: sample neighboring video frames (M3); fixed: use metadata ref_image.")
     parser.add_argument(
         "--ref_neighbor_frames",
         type=int,
@@ -1272,7 +1299,18 @@ def parse_args():
         help="Reference frame sampling window (in frames) around the current segment; used for adjacent-frame sampling.",
     )
     parser.add_argument("--use_8bit_optim", action=argparse.BooleanOptionalAction, default=True, help="Use bitsandbytes 8-bit optimizer to save VRAM on optimizer states")
-    parser.add_argument("--blocks_to_swap", type=int, default=0, help="Number of frozen transformer blocks to swap to CPU during forward/backward to save VRAM (max num_blocks-1)")
+    parser.add_argument("--blocks_to_swap", "--cpu_offload_blocks", dest='blocks_to_swap', type=int, default=0,
+                        help="Stream frozen Linear weights from CPU in the last N blocks (0 to model depth); adapters stay on GPU")
+    parser.add_argument('--activation_offload', action=argparse.BooleanOptionalAction, default=False,
+                        help='Offload gradient-checkpoint boundary activations to CPU')
+    parser.add_argument('--offload_pin_memory', action=argparse.BooleanOptionalAction, default=False,
+                        help='Pin streamed weights and saved activations; increases locked physical RAM use')
+    parser.add_argument('--vae_cpu_offload', action=argparse.BooleanOptionalAction, default=True,
+                        help='Unload VAE to CPU before DiT forward/backward')
+    parser.add_argument('--cpu_cache_gb', type=float, default=4.,
+                        help='Total GiB limit for four CPU caches (latents, VAE reference, CLIP, text); 0 disables')
+    parser.add_argument('--attention_backend', choices=['sdpa', 'auto'], default='sdpa',
+                        help='Native training SDPA (Windows-friendly), or available FlashAttention kernels')
     parser.add_argument("--first_clip_prob", type=float, default=0.2,
                         help="Probability of sampling first-clip training branch. Continuation prob is 1-p.")
     parser.add_argument("--gradient_checkpointing", action=argparse.BooleanOptionalAction, default=True)
@@ -1305,14 +1343,14 @@ def parse_args():
     parser.add_argument(
         "--cfg_drop_clip_prob",
         type=float,
-        default=0.1,
-        help="Train-time dropout: probability to drop CLIP visual features. Forces LoRA to learn identity independently of reference image.",
+        default=0.0,
+        help="Optional CLIP feature dropout; disabled by default.",
     )
     parser.add_argument(
         "--cfg_drop_ref_prob",
         type=float,
-        default=0.05,
-        help="Train-time dropout: probability to drop reference frame VAE condition. Forces LoRA to carry identity information.",
+        default=0.0,
+        help="Optional reference dropout: zero both mask and VAE latents; disabled by default.",
     )
     parser.add_argument(
         "--resume_from",
@@ -1323,35 +1361,6 @@ def parse_args():
 
     parser.add_argument("--override_lr", action=argparse.BooleanOptionalAction, default=False,
                         help="Force override the resumed optimizer's learning rate with the CLI values.")
-    parser.add_argument("--override_shift", type=float, default=None,
-                        help="Force override the auto-selected shift value. Use 11 for 1080 inference consistency, even when training at lower resolution (e.g. stage1 832x528).")
-
-    # Timestep bias (AI Toolkit style two-stage training)
-    parser.add_argument(
-        "--timestep_bias",
-        type=str,
-        default="high_noise",
-        choices=["high_noise", "balanced", "low_noise"],
-        help=(
-            "Timestep sampling bias strategy (AI Toolkit style).\n"
-            "  high_noise : shift=11 formula — focuses on t>875 (structure/composition). DEFAULT. Backward-compatible.\n"
-            "  balanced   : logit-normal sigmoid(N(0,1.6)) — covers full range, medium-noise focus (face + structure).\n"
-            "  low_noise  : logit-normal sigmoid(N(-2.5,1.2)) — focuses on t<300 (fine detail, skin, identity).\n"
-            "Stage-2 recommendation: use --timestep_bias balanced after completing high_noise stage."
-        ),
-    )
-    parser.add_argument(
-        "--bias_switch_step",
-        type=int,
-        default=0,
-        help=(
-            "Auto-switch from --timestep_bias to 'balanced' after this many steps. "
-            "0 = disabled (keep fixed bias for entire run). "
-            "Example: resume with --timestep_bias high_noise --bias_switch_step 0 for pure stage-2 "
-            "OR just pass --timestep_bias balanced to skip straight to balanced."
-        ),
-    )
-
     # Output
     parser.add_argument("--output_dir", type=str, default="output/lora")
     parser.add_argument("--log_every", type=int, default=10)

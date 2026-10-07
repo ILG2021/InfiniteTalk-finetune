@@ -1,0 +1,25 @@
+# Install a matching CUDA-enabled torch/torchvision build before this file.
+# Single-GPU SDPA training: no xfuser, FlashAttention, SageAttention or Triton.
+numpy>=1.23.5,<2
+opencv-python>=4.9.0.80,<4.12
+diffusers>=0.31.0,<1
+transformers>=4.57.1,<5
+accelerate>=1.1.1
+einops>=0.8
+safetensors>=0.5
+huggingface_hub>=0.34,<1
+sentencepiece
+tokenizers>=0.22,<0.24
+tensorboard
+tqdm
+imageio
+imageio-ffmpeg
+easydict
+ftfy
+scikit-image
+loguru
+optimum-quanto==0.2.6
+decord
+bitsandbytes
+soundfile
+librosa

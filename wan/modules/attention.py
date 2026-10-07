@@ -3,23 +3,25 @@ import torch
 import torch.nn as nn
 from einops import rearrange, repeat
 from ..utils.multitalk_utils import RotaryPositionalEmbedding1D, normalize_and_scale, split_token_counts_and_frame_ids
-from xfuser.core.distributed import (
-    get_sequence_parallel_rank,
-    get_sequence_parallel_world_size,
-    get_sp_group,
-)
-import xformers.ops
+try:
+    import xformers.ops
+except (ImportError, OSError):
+    xformers = None
+from ..utils.training_memory import sdpa_attention
+
+# Set by the training entry point; inference retains its existing auto policy.
+TRAINING_ATTENTION_BACKEND = 'auto'
 
 try:
     import flash_attn_interface
     FLASH_ATTN_3_AVAILABLE = True
-except ModuleNotFoundError:
+except (ImportError, OSError):
     FLASH_ATTN_3_AVAILABLE = False
 
 try:
     import flash_attn
     FLASH_ATTN_2_AVAILABLE = True
-except ModuleNotFoundError:
+except (ImportError, OSError):
     FLASH_ATTN_2_AVAILABLE = False
 
 import warnings
@@ -58,6 +60,10 @@ def flash_attention(
     deterministic:  bool. If True, slightly slower and uses more memory.
     dtype:          torch.dtype. Apply when dtype of q/k/v is not float16/bfloat16.
     """
+    if TRAINING_ATTENTION_BACKEND == 'sdpa' or not (FLASH_ATTN_2_AVAILABLE or FLASH_ATTN_3_AVAILABLE):
+        return sdpa_attention(q, k, v, q_lens=q_lens, k_lens=k_lens, dropout_p=dropout_p,
+                              softmax_scale=softmax_scale, q_scale=q_scale, causal=causal,
+                              window_size=window_size, dtype=dtype)
     half_dtypes = (torch.float16, torch.bfloat16)
     assert dtype in half_dtypes
     assert q.device.type == 'cuda' and q.size(-1) <= 256
@@ -255,6 +261,9 @@ class SingleStreamAttention(nn.Module):
         encoder_v = rearrange(encoder_v, "B H M K -> B M H K")
 
         if enable_sp:
+            from xfuser.core.distributed import get_sequence_parallel_world_size, get_sequence_parallel_rank
+            if xformers is None:
+                raise RuntimeError('Sequence parallel audio attention requires xformers')
             # context parallel
             sp_size = get_sequence_parallel_world_size()
             sp_rank = get_sequence_parallel_rank()
@@ -263,7 +272,10 @@ class SingleStreamAttention(nn.Module):
             attn_bias = xformers.ops.fmha.attn_bias.BlockDiagonalMask.from_seqlens(visual_seqlen, kv_seq)
         else:
             attn_bias = None
-        x = xformers.ops.memory_efficient_attention(q, encoder_k, encoder_v, attn_bias=attn_bias, op=None,)
+        if not enable_sp and (TRAINING_ATTENTION_BACKEND == 'sdpa' or xformers is None):
+            x = sdpa_attention(q, encoder_k, encoder_v)
+        else:
+            x = xformers.ops.memory_efficient_attention(q, encoder_k, encoder_v, attn_bias=attn_bias, op=None,)
         x = rearrange(x, "B M H K -> B H M K") 
 
         # linear transform
@@ -377,7 +389,10 @@ class SingleStreamMutiAttention(SingleStreamAttention):
         q = rearrange(q, "B H M K -> B M H K")
         encoder_k = rearrange(encoder_k, "B H M K -> B M H K")
         encoder_v = rearrange(encoder_v, "B H M K -> B M H K")
-        x = xformers.ops.memory_efficient_attention(q, encoder_k, encoder_v, attn_bias=None, op=None,)
+        if TRAINING_ATTENTION_BACKEND == 'sdpa' or xformers is None:
+            x = sdpa_attention(q, encoder_k, encoder_v)
+        else:
+            x = xformers.ops.memory_efficient_attention(q, encoder_k, encoder_v, attn_bias=None, op=None,)
         x = rearrange(x, "B M H K -> B H M K")
 
         # linear transform
